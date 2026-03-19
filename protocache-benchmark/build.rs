@@ -3,6 +3,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use prost::Message;
+use prost_types::FileDescriptorSet;
+use protoc_gen_pcrs::generate_rust_for_file;
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo_root = manifest_dir.parent().unwrap().to_path_buf();
@@ -14,7 +18,7 @@ fn main() {
 
     println!(
         "cargo:rerun-if-changed={}",
-        fixture_root.join("proto/benchmark-test.proto").display()
+        fixture_root.join("proto/test.proto").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
@@ -22,16 +26,49 @@ fn main() {
     );
 
     let prost_proto = out_dir.join("test-prost.proto");
-    let mut prost_source = fs::read_to_string(fixture_root.join("proto/benchmark-test.proto")).unwrap();
+    let pcrs_proto = out_dir.join("test-pcrs.proto");
+    let mut prost_source = fs::read_to_string(fixture_root.join("proto/test.proto")).unwrap();
     prost_source = prost_source.replace("repeated float _ = 1;", "repeated float values = 1;");
     prost_source = prost_source.replace("repeated Vec1D _ = 1;", "repeated Vec1D values = 1;");
     prost_source = prost_source.replace("map<string,Array> _ = 1;", "map<string,Array> entries = 1;");
+    prost_source = prost_source.replace(
+        "\tArrMap arrays = 30;\n}",
+        "\tArrMap arrays = 30;\n\trepeated Mode modev = 32;\n}",
+    );
     fs::write(&prost_proto, prost_source).unwrap();
+
+    let mut pcrs_source = fs::read_to_string(fixture_root.join("proto/test.proto")).unwrap();
+    pcrs_source = pcrs_source.replace(
+        "\tArrMap arrays = 30;\n}",
+        "\tArrMap arrays = 30;\n\trepeated Mode modev = 32;\n}",
+    );
+    fs::write(&pcrs_proto, pcrs_source).unwrap();
 
     prost_build::Config::new()
         .out_dir(&out_dir)
         .compile_protos(&[prost_proto], &[out_dir.clone()])
         .unwrap();
+
+    let descriptor_path = out_dir.join("benchmark-test.desc");
+    let status = Command::new("protoc")
+        .arg(format!("--proto_path={}", out_dir.display()))
+        .arg(format!("--descriptor_set_out={}", descriptor_path.display()))
+        .arg("test-pcrs.proto")
+        .status()
+        .unwrap();
+    if !status.success() {
+        panic!("protoc failed to generate benchmark descriptor set");
+    }
+    let descriptor_bytes = fs::read(&descriptor_path).unwrap();
+    let descriptor_set = FileDescriptorSet::decode(descriptor_bytes.as_slice()).unwrap();
+    let pcrs_file = descriptor_set
+        .file
+        .into_iter()
+        .find(|file| file.name() == "test-pcrs.proto")
+        .unwrap();
+    let pcrs_generated_path = out_dir.join("test_pc.rs");
+    let pcrs_generated = generate_rust_for_file(&pcrs_file).unwrap();
+    fs::write(pcrs_generated_path, pcrs_generated).unwrap();
 
     let flatbuffers_schema = out_dir.join("test.fbs");
     let mut flatbuffers_source = fs::read_to_string(fixture_root.join("benchmark/test.fbs")).unwrap();

@@ -2,119 +2,107 @@
 
 Rust implementation of ProtoCache.
 
-The Rust workspace keeps the same data format and overall capability split as the C++ version, while organizing the code as several crates. The main path is:
+## Provenance
+
+This repository's Rust code is fully AI-generated.
+
+- The implementation, tests, and supporting glue in this workspace were produced by AI.
+- Treat the codebase as generated software: verify behavior with tests before relying on it in production.
+
+The Rust workspace keeps the same data format and overall capability split as the original ProtoCache design. It follows the same high-level boundary as the upstream API split:
 
 - zero-copy read-only runtime
-- schema reflection and validation
-- mutable runtime
+- extension APIs for schema reflection, `.proto` loading and protobuf/prost bridging
 - `protoc` code generator
 
 ## Workspace
 
-`rust/Cargo.toml` contains these crates:
+`Cargo.toml` contains these crates:
 
 | Crate | Purpose |
 |:--|:--|
-| `protocache-core` | Core runtime for reading, writing, hashing and compression |
-| `protocache-schema` | `.proto` parsing, descriptor loading, schema reflection and validation |
-| `protocache-mutable` | Mutable / EX-style runtime |
+| `protocache-core` | Protobuf-free core runtime for reading, writing, hashing, compression and mutable primitives |
+| `protocache-extension` | Extension APIs for `.proto` parsing, descriptor loading, reflection, protobuf/prost bridging and schema-aware mutable APIs |
 | `protoc-gen-pcrs` | Rust code generator for typed APIs |
-| `protocache-benchmark` | Rust benchmark entry for local comparison |
+| `protocache-benchmark` | Local performance harness |
 
 ## Independence from C++
 
-The Rust implementation does not depend on the C++ code at build or runtime.
+The Rust implementation does not depend on any C++ source tree at build or runtime.
 
 - Rust crates only depend on other Rust crates in this workspace and published Rust dependencies.
-- Benchmark and tests may reuse shared fixtures under `tests/fixtures`, but that is data reuse, not code dependency.
+- Tests and local performance tooling may reuse fixture data, but that is data reuse, not code dependency.
 
 Some workflows still rely on external tools:
 
 - `protoc` is used for `.proto` parsing and code generation related flows.
-- `flatc` is used only by the benchmark crate.
+- `flatc` is used only by the local performance harness.
 
 ## Usage
 
 Run workspace tests:
 
 ```bash
-cd rust
 cargo test --workspace
-```
-
-Run the benchmark:
-
-```bash
-cd rust
-cargo run -p protocache-benchmark --release -- --loops 1000
 ```
 
 Generate Rust typed APIs with the plugin:
 
 ```bash
-cd rust
 cargo run -p protoc-gen-pcrs -- < input.bin > output.bin
 ```
 
-### Recommended APIs
 
-For most callers, prefer the lowest-requirement entry points from `protocache-mutable`:
+### API Layers
 
-- if you already have protobuf bytes, use `serialize_protobuf_bytes_from_proto_file`
-- if you already have a `prost::Message`, use `serialize_prost_message_from_proto_file`
-- if you already have protocache words and want mutable access, use `MessageMut::from_proto_file`
+The Rust API surface is grouped into a small set of layers.
 
-Convert protobuf bytes to protocache:
+Core runtime APIs:
 
-```rust
-use protocache_mutable::serialize_protobuf_bytes_from_proto_file;
+- `protocache_core::runtime`: zero-copy read-only access to protocache data
+- `protocache_core::mutable`: mutable APIs such as `MutableMessage`, `MutableMap`, and `MutableArray`
+- `protocache_core::encoding`: low-level encoding primitives and `Buffer`
 
-let words = serialize_protobuf_bytes_from_proto_file(
-    "tests/fixtures/proto/benchmark-test.proto",
-    "test.Main",
-    &protobuf_bytes,
-)?;
-```
+Support APIs:
 
-Convert a `prost` message to protocache:
+- `protocache_extension::utils`: `.proto` loading, JSON helpers, and protobuf/prost -> protocache conversion
+- `protocache_extension::reflection`: schema reflection support
 
-```rust
-use prost::Message;
-use protocache_mutable::serialize_prost_message_from_proto_file;
+Error model:
 
-let protobuf = my_pb::Main::decode(&*protobuf_bytes)?;
-let words = serialize_prost_message_from_proto_file(
-    &protobuf,
-    "tests/fixtures/proto/benchmark-test.proto",
-    "test.Main",
-)?;
-```
+- protobuf/prost bridge operations use `protocache_core::MutableError`
+- JSON helpers use `protocache_extension::utils::JsonError`
 
-Open existing protocache data for mutable access and reserialize:
+Primary entry points:
 
-```rust
-use protocache_core::Buffer;
-use protocache_mutable::MessageMut;
+- `protocache_core::access`, `protocache_core::serialize`, `protocache_core::perfect_hash`
+- `protocache_core::mutable`
+- `protocache_extension::{reflection, utils}`
 
-let mut root = MessageMut::from_proto_file(
-    "tests/fixtures/proto/benchmark-test.proto",
-    "test.Main",
-    &words,
-)?;
-root.set_i32("i32", 42)?;
+### Recommended Usage
 
-let mut buffer = Buffer::new();
-let encoded = root.serialize_into_buffer(&mut buffer)?;
-```
+Prefer these APIs for long-term integration:
+
+- for zero-copy reads, start from `protocache_core::runtime::MessageView`
+- for mutable writes, prefer `protocache_core::mutable::MutableMessage`
+- for extension-side conversion flows, prefer `protocache_extension::utils::serialize`
 
 ## Notes
 
-Compared with the C++ tree, the Rust side is split into smaller crates instead of a single library plus extension modules. This keeps dependency boundaries clearer:
+The Rust side follows the same two-layer split as the upstream design:
 
-- depend on `protocache-core` for read-only runtime
-- add `protocache-schema` for `.proto` parsing and schema handling
-- add `protocache-mutable` for mutable access
+- depend on `protocache-core` for the protobuf-free runtime and mutable primitives
+- add `protocache-extension` when you need `extension/*` capabilities such as `.proto` parsing, descriptor handling, reflection, or protobuf/prost bridging
 
-The mutable crate still contains internal reflection-based plumbing, but the recommended public surface is now schema-path based. Most users should not need to work with `DynamicMessage`, `ReflectMessage`, or descriptor wiring directly.
+The main runtime surface should be read as:
 
-The remaining work is mainly around API polish, benchmark optimization and broader regression coverage, not a missing core implementation.
+- `protocache_core::{runtime, mutable, encoding}` are the primary Rust-first public APIs
+- `protocache_core::{access, mutable, serialize, perfect_hash}` are the primary top-level modules
+- `protocache_extension::{reflection, utils}` are the primary extension-side public APIs
+
+Most users should not need to work with `DynamicMessage`, `ReflectMessage`, or descriptor wiring directly.
+
+The current state is:
+
+- functionality is covered by workspace tests and compatibility checks
+- some serialization and reflection-heavy paths still need optimization work

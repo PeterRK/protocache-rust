@@ -1,18 +1,25 @@
-use std::ffi::OsStr;
+use std::ffi::CString;
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+#[cfg(test)]
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use prost::Message;
-use prost_reflect::{DescriptorError as ReflectDescriptorError, DescriptorPool as ReflectDescriptorPool};
-use prost_types::{FileDescriptorProto, FileDescriptorSet};
-use crate::{DescriptorPool, RegisterError};
-use tempfile::TempDir;
-
+use prost_reflect::DescriptorError as ReflectDescriptorError;
+use prost_types::FileDescriptorProto;
+#[cfg(test)]
+use prost_types::FileDescriptorSet;
+use crate::reflection::RegisterError;
+#[cfg(test)]
+use crate::reflection::{DescriptorPool, build_descriptor_pool};
+#[cfg(test)]
+use prost_reflect::DescriptorPool as ReflectDescriptorPool;
 #[derive(Debug)]
 pub enum ProtoError {
     Io(std::io::Error),
-    ProtocFailed { stderr: String },
+    ParseFailed { message: String },
     Decode(prost::DecodeError),
     Reflect(ReflectDescriptorError),
     MissingFile { name: String },
@@ -47,7 +54,7 @@ impl std::fmt::Display for ProtoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
-            Self::ProtocFailed { stderr } => write!(f, "protoc failed: {stderr}"),
+            Self::ParseFailed { message } => write!(f, "proto parse failed: {message}"),
             Self::Decode(err) => write!(f, "{err}"),
             Self::Reflect(err) => write!(f, "{err}"),
             Self::MissingFile { name } => write!(f, "missing file in descriptor set: {name}"),
@@ -62,29 +69,55 @@ impl std::error::Error for ProtoError {
             Self::Io(err) => Some(err),
             Self::Decode(err) => Some(err),
             Self::Reflect(err) => Some(err),
-            Self::ProtocFailed { .. } | Self::MissingFile { .. } | Self::Register(_) => None,
+            Self::ParseFailed { .. } | Self::MissingFile { .. } | Self::Register(_) => None,
         }
     }
 }
 
 pub fn parse_proto(source: &str, file_name: &str) -> Result<FileDescriptorProto, ProtoError> {
-    let temp_dir = tempfile::Builder::new()
-        .prefix("parse-proto-")
-        .tempdir()?;
-    let proto_path = temp_dir.path().join(file_name);
-    if let Some(parent) = proto_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&proto_path, source)?;
-
-    parse_proto_file_with_imports(&proto_path, &[temp_dir.path().to_path_buf()])
+    let source_cstr = CString::new(source).map_err(|_| ProtoError::ParseFailed {
+        message: "proto source contains interior NUL byte".to_owned(),
+    })?;
+    let file_name_cstr = CString::new(file_name).map_err(|_| ProtoError::ParseFailed {
+        message: format!("file name contains interior NUL byte: {file_name}"),
+    })?;
+    let bytes = unsafe {
+        parse_proto_via_ffi(
+            |out_bytes, out_len, out_error| {
+                protocache_parse_proto(
+                    source_cstr.as_ptr(),
+                    file_name_cstr.as_ptr(),
+                    out_bytes,
+                    out_len,
+                    out_error,
+                )
+            },
+            "libprotoc parser failed",
+        )?
+    };
+    FileDescriptorProto::decode(bytes.as_slice()).map_err(ProtoError::Decode)
 }
 
 pub fn parse_proto_file(path: impl AsRef<Path>) -> Result<FileDescriptorProto, ProtoError> {
-    parse_proto_file_with_imports(path.as_ref(), &[])
+    let path_cstr = path_to_cstring(path.as_ref())?;
+    let bytes = unsafe {
+        parse_proto_via_ffi(
+            |out_bytes, out_len, out_error| {
+                protocache_parse_proto_file(
+                    path_cstr.as_ptr(),
+                    out_bytes,
+                    out_len,
+                    out_error,
+                )
+            },
+            "libprotoc file parser failed",
+        )?
+    };
+    FileDescriptorProto::decode(bytes.as_slice()).map_err(ProtoError::Decode)
 }
 
-pub fn load_descriptor_pool_from_proto(
+#[cfg(test)]
+pub(crate) fn load_descriptor_pool_from_proto(
     source: &str,
     file_name: &str,
 ) -> Result<DescriptorPool, ProtoError> {
@@ -98,25 +131,19 @@ pub fn load_descriptor_pool_from_proto(
     fs::write(&proto_path, source)?;
 
     let set = parse_proto_file_set_with_imports(&proto_path, &[temp_dir.path().to_path_buf()])?;
-    let mut pool = DescriptorPool::default();
-    for file in &set.file {
-        pool.register(file)?;
-    }
-    Ok(pool)
+    build_descriptor_pool(&set.file).map_err(ProtoError::Register)
 }
 
-pub fn load_descriptor_pool_from_proto_file(
+#[cfg(test)]
+pub(crate) fn load_descriptor_pool_from_proto_file(
     path: impl AsRef<Path>,
 ) -> Result<DescriptorPool, ProtoError> {
     let set = parse_proto_file_set_with_imports(path.as_ref(), &[])?;
-    let mut pool = DescriptorPool::default();
-    for file in &set.file {
-        pool.register(file)?;
-    }
-    Ok(pool)
+    build_descriptor_pool(&set.file).map_err(ProtoError::Register)
 }
 
-pub fn load_reflect_descriptor_pool_from_proto_file(
+#[cfg(test)]
+pub(crate) fn load_reflect_descriptor_pool_from_proto_file(
     path: impl AsRef<Path>,
 ) -> Result<ReflectDescriptorPool, ProtoError> {
     let set = parse_proto_file_set_with_imports(path.as_ref(), &[])?;
@@ -124,60 +151,147 @@ pub fn load_reflect_descriptor_pool_from_proto_file(
         .map_err(ProtoError::Reflect)
 }
 
-fn parse_proto_file_with_imports(
-    path: &Path,
-    extra_imports: &[PathBuf],
-) -> Result<FileDescriptorProto, ProtoError> {
-    let set = parse_proto_file_set_with_imports(path, extra_imports)?;
-    find_target_file(set, path)
+#[cfg(test)]
+pub(crate) fn parse_proto_file_set(path: impl AsRef<Path>) -> Result<FileDescriptorSet, ProtoError> {
+    parse_proto_file_set_with_imports(path.as_ref(), &[])
 }
 
+#[cfg(test)]
 fn parse_proto_file_set_with_imports(
     path: &Path,
     extra_imports: &[PathBuf],
 ) -> Result<FileDescriptorSet, ProtoError> {
-    let temp_dir = tempdir_with_prefix("descriptor-out-")?;
-    let descriptor_path = temp_dir.path().join("out.pb");
-
-    let mut command = Command::new("protoc");
-    if let Some(parent) = path.parent() {
-        command.arg(format!("--proto_path={}", parent.display()));
-    }
-    for import in extra_imports {
-        command.arg(format!("--proto_path={}", import.display()));
-    }
-    command.arg("--include_imports");
-    command.arg(format!("--descriptor_set_out={}", descriptor_path.display()));
-    command.arg(path.file_name().unwrap_or_else(|| OsStr::new("input.proto")));
-
-    let output = command.current_dir(path.parent().unwrap_or_else(|| Path::new("."))).output()?;
-    if !output.status.success() {
-        return Err(ProtoError::ProtocFailed {
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-
-    let bytes = fs::read(&descriptor_path)?;
+    let bytes = parse_descriptor_set_bytes(path, extra_imports)?;
     FileDescriptorSet::decode(bytes.as_slice()).map_err(ProtoError::Decode)
 }
 
-fn find_target_file(set: FileDescriptorSet, path: &Path) -> Result<FileDescriptorProto, ProtoError> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_owned();
-    set.file
-        .into_iter()
-        .find(|file| file.name() == file_name)
-        .ok_or(ProtoError::MissingFile { name: file_name })
+unsafe fn parse_proto_via_ffi(
+    invoke: impl FnOnce(*mut *mut u8, *mut usize, *mut *mut std::os::raw::c_char) -> i32,
+    fallback_message: &str,
+) -> Result<FfiBytes, ProtoError> {
+    let mut out_bytes = std::ptr::null_mut();
+    let mut out_len = 0usize;
+    let mut out_error = std::ptr::null_mut();
+    let status = invoke(&mut out_bytes, &mut out_len, &mut out_error);
+    if status != 0 {
+        return Err(ProtoError::ParseFailed {
+            message: unsafe { ffi_error_message(out_error, fallback_message) },
+        });
+    }
+    Ok(FfiBytes::new(out_bytes, out_len))
 }
 
-fn tempdir_with_prefix(prefix: &str) -> Result<TempDir, ProtoError> {
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir()
-        .map_err(ProtoError::Io)
+#[cfg(test)]
+fn parse_descriptor_set_bytes(
+    path: &Path,
+    extra_imports: &[PathBuf],
+) -> Result<FfiBytes, ProtoError> {
+    let path_cstr = path_to_cstring(path)?;
+    let import_cstrs = extra_imports
+        .iter()
+        .map(|import| path_to_cstring(import))
+        .collect::<Result<Vec<_>, _>>()?;
+    let import_ptrs = import_cstrs.iter().map(|import| import.as_ptr()).collect::<Vec<_>>();
+
+    let mut out_bytes = std::ptr::null_mut();
+    let mut out_len = 0usize;
+    let mut out_error = std::ptr::null_mut();
+
+    let status = unsafe {
+        protocache_parse_proto_file_set(
+            path_cstr.as_ptr(),
+            import_ptrs.as_ptr(),
+            import_ptrs.len(),
+            &mut out_bytes,
+            &mut out_len,
+            &mut out_error,
+        )
+    };
+
+    if status != 0 {
+        return Err(ProtoError::ParseFailed {
+            message: unsafe { ffi_error_message(out_error, "libprotoc parsing failed") },
+        });
+    }
+
+    Ok(FfiBytes::new(out_bytes, out_len))
+}
+
+fn path_to_cstring(path: &Path) -> Result<CString, ProtoError> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| ProtoError::ParseFailed {
+        message: format!("path contains interior NUL byte: {}", path.display()),
+    })
+}
+
+struct FfiBytes {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl FfiBytes {
+    fn new(ptr: *mut u8, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.ptr.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+}
+
+impl Drop for FfiBytes {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { protocache_free_proto_bytes(self.ptr) };
+        }
+    }
+}
+
+unsafe fn ffi_error_message(
+    out_error: *mut std::os::raw::c_char,
+    fallback_message: &str,
+) -> String {
+    if out_error.is_null() {
+        return fallback_message.to_owned();
+    }
+    let message = unsafe { std::ffi::CStr::from_ptr(out_error) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { protocache_free_proto_error(out_error) };
+    message
+}
+
+unsafe extern "C" {
+    fn protocache_parse_proto(
+        source: *const std::os::raw::c_char,
+        file_name: *const std::os::raw::c_char,
+        out_bytes: *mut *mut u8,
+        out_len: *mut usize,
+        out_error: *mut *mut std::os::raw::c_char,
+    ) -> i32;
+
+    fn protocache_parse_proto_file(
+        path: *const std::os::raw::c_char,
+        out_bytes: *mut *mut u8,
+        out_len: *mut usize,
+        out_error: *mut *mut std::os::raw::c_char,
+    ) -> i32;
+
+    #[cfg(test)]
+    fn protocache_parse_proto_file_set(
+        proto_path: *const std::os::raw::c_char,
+        extra_import_paths: *const *const std::os::raw::c_char,
+        extra_import_count: usize,
+        out_bytes: *mut *mut u8,
+        out_len: *mut usize,
+        out_error: *mut *mut std::os::raw::c_char,
+    ) -> i32;
+
+    fn protocache_free_proto_bytes(bytes: *mut u8);
+    fn protocache_free_proto_error(error: *mut std::os::raw::c_char);
 }
 
 #[cfg(test)]
@@ -193,6 +307,7 @@ mod tests {
     use super::*;
 
     use std::io::Write as _;
+    use tempfile::TempDir;
 
     fn fixture_schema() -> PathBuf {
         workspace_root().join("tests/fixtures/proto/test.proto")
@@ -253,11 +368,11 @@ mod tests {
     #[test]
     fn reports_parse_failures() {
         let err = parse_proto("syntax = \"proto3\"; message {", "broken.proto").unwrap_err();
-        assert!(matches!(err, ProtoError::ProtocFailed { .. }));
+        assert!(matches!(err, ProtoError::ParseFailed { .. }));
 
         let err = parse_proto_file(workspace_root().join("tests/fixtures/proto/missing.proto"))
             .unwrap_err();
-        assert!(matches!(err, ProtoError::ProtocFailed { .. } | ProtoError::Io(_)));
+        assert!(matches!(err, ProtoError::ParseFailed { .. } | ProtoError::Io(_)));
     }
 
     #[test]
@@ -265,9 +380,12 @@ mod tests {
         let pool = load_descriptor_pool_from_proto_file(fixture_schema()).unwrap();
 
         let root = pool.find("test.Main").unwrap();
-        assert_eq!(root.fields.get("matrix").unwrap().value_type.as_deref(), Some("test.Vec2D"));
+        assert_eq!(
+            root.fields.get("matrix").unwrap().value_type,
+            "test.Vec2D"
+        );
         assert!(pool.find("test.Vec2D").unwrap().is_alias());
-        assert!(pool.find("test.ArrMap").unwrap().alias.as_ref().unwrap().is_map());
+        assert!(pool.find("test.ArrMap").unwrap().alias.is_map());
     }
 
     #[test]
@@ -306,7 +424,7 @@ mod tests {
         let pool = load_descriptor_pool_from_proto_file(dir.path().join("root.proto")).unwrap();
         let root = pool.find("demo.Root").unwrap();
         let child = root.fields.get("child").unwrap();
-        assert_eq!(child.value_type.as_deref(), Some("shared.Common"));
+        assert_eq!(child.value_type, "shared.Common");
         assert!(pool.find("shared.Common").is_some());
     }
 

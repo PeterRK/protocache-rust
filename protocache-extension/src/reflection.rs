@@ -1,4 +1,4 @@
-mod proto;
+//! Schema reflection APIs matching `extension/reflection.h`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -8,13 +8,21 @@ use prost_types::{
     field_descriptor_proto::{Label, Type},
 };
 
-pub use proto::{
-    ProtoError, load_descriptor_pool_from_proto, load_descriptor_pool_from_proto_file,
-    load_reflect_descriptor_pool_from_proto_file, parse_proto, parse_proto_file,
-};
+#[cfg(test)]
+pub(crate) fn build_descriptor_pool(
+    files: &[FileDescriptorProto],
+) -> Result<DescriptorPool, RegisterError> {
+    let mut pool = DescriptorPool::default();
+    for file in files {
+        pool.register(file)?;
+    }
+    Ok(pool)
+}
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FieldType {
+    None = 0,
     Message,
     Bytes,
     String,
@@ -26,35 +34,45 @@ pub enum FieldType {
     Int32,
     Bool,
     Enum,
-    Unknown,
+    Unknown = 255,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Field {
     pub id: usize,
     pub repeated: bool,
-    pub key: Option<FieldType>,
+    pub key: FieldType,
     pub value: FieldType,
-    pub value_type: Option<String>,
-    pub tags: BTreeMap<String, String>,
+    pub value_type: String,
+    pub tags: HashMap<String, String>,
 }
 
 impl Field {
     pub fn is_map(&self) -> bool {
-        self.key.is_some()
+        self.key != FieldType::None
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Descriptor {
-    pub alias: Option<Field>,
-    pub fields: BTreeMap<String, Field>,
-    pub tags: BTreeMap<String, String>,
+    pub alias: Field,
+    pub fields: HashMap<String, Field>,
+    pub tags: HashMap<String, String>,
+}
+
+impl Default for Descriptor {
+    fn default() -> Self {
+        Self {
+            alias: empty_field(),
+            fields: HashMap::new(),
+            tags: HashMap::new(),
+        }
+    }
 }
 
 impl Descriptor {
     pub fn is_alias(&self) -> bool {
-        self.alias.is_some()
+        self.alias.value != FieldType::None
     }
 }
 
@@ -108,6 +126,7 @@ impl DescriptorPool {
         self.descriptors.get(full_name)
     }
 
+    #[cfg(test)]
     pub fn find_enum_number(&self, enum_name: &str, variant: &str) -> Option<i32> {
         self.enum_values.get(enum_name)?.get(variant).copied()
     }
@@ -150,8 +169,8 @@ impl DescriptorPool {
         validate_field_shape(&message_name, &message.field)?;
 
         let mut descriptor = Descriptor {
-            alias: None,
-            fields: BTreeMap::new(),
+            alias: empty_field(),
+            fields: HashMap::new(),
             tags: collect_tags(
                 message
                     .options
@@ -165,7 +184,7 @@ impl DescriptorPool {
             if field.label() != Label::Repeated {
                 return Err(RegisterError::InvalidAlias { name: message_name });
             }
-            descriptor.alias = Some(self.convert_field(&message_name, field, &map_entries)?);
+            descriptor.alias = self.convert_field(&message_name, field, &map_entries)?;
         } else {
             let mut used_ids = BTreeSet::new();
             for field in live_fields {
@@ -208,50 +227,39 @@ impl DescriptorPool {
         map_entries: &HashMap<String, DescriptorProto>,
     ) -> Result<Field, RegisterError> {
         let repeated = source.label() == Label::Repeated;
-        let mut value = convert_type(source);
-        if !matches!(
-            value,
-            FieldType::Message
-                | FieldType::Bytes
-                | FieldType::String
-                | FieldType::Double
-                | FieldType::Float
-                | FieldType::Uint64
-                | FieldType::Uint32
-                | FieldType::Int64
-                | FieldType::Int32
-                | FieldType::Bool
-                | FieldType::Enum
-                | FieldType::Unknown
-        ) {
-            return Err(RegisterError::UnsupportedFieldType {
-                message: message_name.to_owned(),
-                field: source.name().to_owned(),
-            });
-        }
+        let mut value = convert_type(source).ok_or_else(|| RegisterError::UnsupportedFieldType {
+            message: message_name.to_owned(),
+            field: source.name().to_owned(),
+        })?;
 
-        let mut key = None;
-        let mut value_type = None;
+        let mut key = FieldType::None;
+        let mut value_type = String::new();
         if matches!(value, FieldType::Message | FieldType::Unknown) {
             let source_type = normalize_type_name(source.type_name());
             if let Some(entry) = map_entries.get(&source_type) {
-                let map_key = convert_type(&entry.field[0]);
-                if !can_be_key(map_key) {
+                let map_key = convert_type(&entry.field[0]).ok_or_else(|| RegisterError::UnsupportedFieldType {
+                    message: message_name.to_owned(),
+                    field: source.name().to_owned(),
+                })?;
+                let Some(map_key) = as_key_type(map_key) else {
                     return Err(RegisterError::UnsupportedMapKeyType {
                         message: message_name.to_owned(),
                         field: source.name().to_owned(),
                         key: map_key,
                     });
-                }
-                let map_value = convert_type(&entry.field[1]);
-                key = Some(map_key);
+                };
+                let map_value = convert_type(&entry.field[1]).ok_or_else(|| RegisterError::UnsupportedFieldType {
+                    message: message_name.to_owned(),
+                    field: source.name().to_owned(),
+                })?;
+                key = map_key;
                 value = map_value;
                 let nested_type = normalize_type_name(entry.field[1].type_name());
                 if !nested_type.is_empty() {
-                    value_type = Some(nested_type);
+                    value_type = nested_type;
                 }
             } else if !source_type.is_empty() {
-                value_type = Some(source_type);
+                value_type = source_type;
             }
         }
 
@@ -275,8 +283,8 @@ impl DescriptorPool {
         full_name: &str,
         descriptor: &mut Descriptor,
     ) -> Result<(), RegisterError> {
-        if let Some(alias) = &mut descriptor.alias {
-            self.resolve_field_type(full_name, "_", alias)?;
+        if descriptor.is_alias() {
+            self.resolve_field_type(full_name, "_", &mut descriptor.alias)?;
         } else {
             for (field_name, field) in &mut descriptor.fields {
                 self.resolve_field_type(full_name, field_name, field)?;
@@ -294,7 +302,7 @@ impl DescriptorPool {
         if field.value != FieldType::Unknown {
             return Ok(());
         }
-        let unresolved = field.value_type.clone().unwrap_or_default();
+        let unresolved = field.value_type.clone();
         let resolved = self.resolve_type_name(message_name, &unresolved).ok_or_else(|| {
             RegisterError::UnknownType {
                 message: message_name.to_owned(),
@@ -305,10 +313,10 @@ impl DescriptorPool {
 
         if self.enums.contains(&resolved) {
             field.value = FieldType::Enum;
-            field.value_type = Some(resolved);
+            field.value_type.clear();
         } else {
             field.value = FieldType::Message;
-            field.value_type = Some(resolved);
+            field.value_type = resolved;
         }
         Ok(())
     }
@@ -370,36 +378,46 @@ fn normalize_type_name(type_name: &str) -> String {
     type_name.trim_start_matches('.').to_owned()
 }
 
-fn convert_type(field: &FieldDescriptorProto) -> FieldType {
+fn convert_type(field: &FieldDescriptorProto) -> Option<FieldType> {
+    if field.r#type.is_none() {
+        return Some(FieldType::Unknown);
+    }
     match Type::try_from(field.r#type.unwrap_or_default()) {
-        Ok(Type::Message) => FieldType::Unknown,
-        Ok(Type::Bytes) => FieldType::Bytes,
-        Ok(Type::String) => FieldType::String,
-        Ok(Type::Double) => FieldType::Double,
-        Ok(Type::Float) => FieldType::Float,
-        Ok(Type::Fixed64) | Ok(Type::Uint64) => FieldType::Uint64,
-        Ok(Type::Fixed32) | Ok(Type::Uint32) => FieldType::Uint32,
-        Ok(Type::Sfixed64) | Ok(Type::Sint64) | Ok(Type::Int64) => FieldType::Int64,
-        Ok(Type::Sfixed32) | Ok(Type::Sint32) | Ok(Type::Int32) => FieldType::Int32,
-        Ok(Type::Bool) => FieldType::Bool,
-        Ok(Type::Enum) => FieldType::Unknown,
-        _ => FieldType::Unknown,
+        Ok(Type::Message) => Some(FieldType::Unknown),
+        Ok(Type::Bytes) => Some(FieldType::Bytes),
+        Ok(Type::String) => Some(FieldType::String),
+        Ok(Type::Double) => Some(FieldType::Double),
+        Ok(Type::Float) => Some(FieldType::Float),
+        Ok(Type::Fixed64) | Ok(Type::Uint64) => Some(FieldType::Uint64),
+        Ok(Type::Fixed32) | Ok(Type::Uint32) => Some(FieldType::Uint32),
+        Ok(Type::Sfixed64) | Ok(Type::Sint64) | Ok(Type::Int64) => Some(FieldType::Int64),
+        Ok(Type::Sfixed32) | Ok(Type::Sint32) | Ok(Type::Int32) => Some(FieldType::Int32),
+        Ok(Type::Bool) => Some(FieldType::Bool),
+        Ok(Type::Enum) => Some(FieldType::Unknown),
+        _ => None,
     }
 }
 
-fn can_be_key(value: FieldType) -> bool {
-    matches!(
-        value,
-        FieldType::String
-            | FieldType::Uint64
-            | FieldType::Uint32
-            | FieldType::Int64
-            | FieldType::Int32
-    )
+fn as_key_type(value: FieldType) -> Option<FieldType> {
+    match value {
+        FieldType::String => Some(FieldType::String),
+        FieldType::Uint64 => Some(FieldType::Uint64),
+        FieldType::Uint32 => Some(FieldType::Uint32),
+        FieldType::Int64 => Some(FieldType::Int64),
+        FieldType::Int32 => Some(FieldType::Int32),
+        FieldType::None
+        | FieldType::Message
+        | FieldType::Bytes
+        | FieldType::Double
+        | FieldType::Float
+        | FieldType::Bool
+        | FieldType::Enum
+        | FieldType::Unknown => None,
+    }
 }
 
-fn collect_tags(options: Option<&[UninterpretedOption]>) -> BTreeMap<String, String> {
-    let mut tags = BTreeMap::new();
+fn collect_tags(options: Option<&[UninterpretedOption]>) -> HashMap<String, String> {
+    let mut tags = HashMap::new();
     for option in options.into_iter().flatten() {
         if option.name.len() == 1 {
             let name = &option.name[0];
@@ -414,6 +432,17 @@ fn collect_tags(options: Option<&[UninterpretedOption]>) -> BTreeMap<String, Str
         }
     }
     tags
+}
+
+fn empty_field() -> Field {
+    Field {
+        id: usize::MAX,
+        repeated: false,
+        key: FieldType::None,
+        value: FieldType::None,
+        value_type: String::new(),
+        tags: HashMap::new(),
+    }
 }
 
 fn is_map_entry(options: Option<&MessageOptions>) -> bool {
@@ -449,10 +478,7 @@ fn collect_enum_values(item: &EnumDescriptorProto) -> BTreeMap<String, i32> {
 mod tests {
     use super::*;
 
-    use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use prost::Message;
     use prost_types::{
         EnumValueDescriptorProto, FieldOptions, FileDescriptorSet, MessageOptions,
         field_descriptor_proto::Label,
@@ -464,13 +490,13 @@ mod tests {
         pool.register(&fixture_file()).unwrap();
 
         let root = pool.find("test.Main").unwrap();
-        assert_eq!(root.tags.get("test_b"), Some(&"123".to_owned()));
+        assert_eq!(root.tags.get("test_b").map(String::as_str), Some("123"));
 
         let f64_field = root.fields.get("f64").unwrap();
         assert_eq!(f64_field.id, 9);
         assert!(!f64_field.repeated);
         assert_eq!(f64_field.value, FieldType::Double);
-        assert_eq!(f64_field.tags.get("mark"), Some(&"xyz".to_owned()));
+        assert_eq!(f64_field.tags.get("mark").map(String::as_str), Some("xyz"));
 
         let strv = root.fields.get("strv").unwrap();
         assert!(strv.repeated);
@@ -478,42 +504,42 @@ mod tests {
 
         let mode = root.fields.get("mode").unwrap();
         assert_eq!(mode.value, FieldType::Enum);
-        assert_eq!(mode.value_type.as_deref(), Some("test.Mode"));
+        assert!(mode.value_type.is_empty());
         assert_eq!(pool.find_enum_number("test.Mode", "MODE_C"), Some(2));
 
         let object = root.fields.get("object").unwrap();
         assert_eq!(object.value, FieldType::Message);
-        assert_eq!(object.value_type.as_deref(), Some("test.Small"));
-        let object_desc = pool.find(object.value_type.as_deref().unwrap()).unwrap();
+        assert_eq!(object.value_type, "test.Small");
+        let object_desc = pool.find(&object.value_type).unwrap();
         assert!(!object_desc.is_alias());
         assert_eq!(object_desc.fields.get("flag").unwrap().value, FieldType::Bool);
 
         let index = root.fields.get("index").unwrap();
         assert!(index.repeated);
         assert!(index.is_map());
-        assert_eq!(index.key, Some(FieldType::String));
+        assert_eq!(index.key, FieldType::String);
         assert_eq!(index.value, FieldType::Int32);
 
         let matrix = root.fields.get("matrix").unwrap();
-        let matrix_desc = pool.find(matrix.value_type.as_deref().unwrap()).unwrap();
-        let outer_alias = matrix_desc.alias.as_ref().unwrap();
+        let matrix_desc = pool.find(&matrix.value_type).unwrap();
+        let outer_alias = &matrix_desc.alias;
         assert!(outer_alias.repeated);
         assert!(!outer_alias.is_map());
         assert_eq!(outer_alias.value, FieldType::Message);
-        let inner_alias_desc = pool.find(outer_alias.value_type.as_deref().unwrap()).unwrap();
-        let inner_alias = inner_alias_desc.alias.as_ref().unwrap();
+        let inner_alias_desc = pool.find(&outer_alias.value_type).unwrap();
+        let inner_alias = &inner_alias_desc.alias;
         assert!(inner_alias.repeated);
         assert_eq!(inner_alias.value, FieldType::Float);
 
         let arrays = root.fields.get("arrays").unwrap();
-        let arrays_desc = pool.find(arrays.value_type.as_deref().unwrap()).unwrap();
-        let alias = arrays_desc.alias.as_ref().unwrap();
+        let arrays_desc = pool.find(&arrays.value_type).unwrap();
+        let alias = &arrays_desc.alias;
         assert!(alias.repeated);
         assert!(alias.is_map());
-        assert_eq!(alias.key, Some(FieldType::String));
+        assert_eq!(alias.key, FieldType::String);
         assert_eq!(alias.value, FieldType::Message);
-        let array_desc = pool.find(alias.value_type.as_deref().unwrap()).unwrap();
-        assert_eq!(array_desc.alias.as_ref().unwrap().value, FieldType::Float);
+        let array_desc = pool.find(&alias.value_type).unwrap();
+        assert_eq!(array_desc.alias.value, FieldType::Float);
     }
 
     #[test]
@@ -573,7 +599,7 @@ mod tests {
         let root = pool.find("test.Main").unwrap();
         assert_eq!(root.fields.get("matrix").unwrap().value, FieldType::Message);
         assert!(pool.find("test.Vec2D").unwrap().is_alias());
-        assert!(pool.find("test.ArrMap").unwrap().alias.as_ref().unwrap().is_map());
+        assert!(pool.find("test.ArrMap").unwrap().alias.is_map());
     }
 
     fn fixture_file() -> FileDescriptorProto {
@@ -922,29 +948,7 @@ mod tests {
     }
 
     fn compile_descriptor_set(proto_dir: PathBuf, file_name: &str) -> FileDescriptorSet {
-        let out_dir = unique_temp_dir();
-        fs::create_dir_all(&out_dir).unwrap();
-        let out_path = out_dir.join("descriptor.pb");
-
-        let status = Command::new("protoc")
-            .arg(format!("--proto_path={}", proto_dir.display()))
-            .arg(format!("--descriptor_set_out={}", out_path.display()))
-            .arg(file_name)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let bytes = fs::read(&out_path).unwrap();
-        fs::remove_dir_all(out_dir).unwrap();
-        FileDescriptorSet::decode(bytes.as_slice()).unwrap()
-    }
-
-    fn unique_temp_dir() -> PathBuf {
-        tempfile::Builder::new()
-            .prefix("pcrs-reflect-test-")
-            .tempdir()
-            .unwrap()
-            .keep()
+        crate::proto::parse_proto_file_set(proto_dir.join(file_name)).unwrap()
     }
 
     fn workspace_root() -> PathBuf {

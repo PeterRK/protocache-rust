@@ -1,4 +1,9 @@
-use crate::{Buffer, Scalar, hash128};
+//! Serialization surface matching `serialize.h`.
+
+pub use crate::Buffer;
+
+use crate::hash::hash128;
+use crate::Scalar;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Segment {
@@ -7,6 +12,7 @@ pub struct Segment {
 }
 
 impl Segment {
+    #[inline(always)]
     pub fn end(self) -> usize {
         self.pos - self.len
     }
@@ -20,10 +26,12 @@ pub struct Unit {
 }
 
 impl Unit {
+    #[inline(always)]
     pub fn empty() -> Self {
         Self::default()
     }
 
+    #[inline(always)]
     pub fn inline(words: &[u32]) -> Self {
         assert!(words.len() <= 3);
         let mut data = [0u32; 3];
@@ -35,6 +43,7 @@ impl Unit {
         }
     }
 
+    #[inline(always)]
     pub fn segment(last: usize, now: usize) -> Self {
         Self {
             inline_len: 0,
@@ -46,6 +55,7 @@ impl Unit {
         }
     }
 
+    #[inline(always)]
     pub fn size(&self) -> usize {
         if self.inline_len != 0 {
             self.inline_len
@@ -54,23 +64,28 @@ impl Unit {
         }
     }
 
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.size() == 0
     }
 
+    #[inline(always)]
     pub fn is_segment(&self) -> bool {
         self.inline_len == 0 && self.segment.len != 0
     }
 
+    #[inline(always)]
     pub fn inline_words(&self) -> &[u32] {
         &self.inline_data[..self.inline_len]
     }
 
+    #[inline(always)]
     pub fn segment_info(&self) -> Segment {
         self.segment
     }
 }
 
+#[inline(always)]
 fn write_varint(buf: &mut [u8; 5], mut n: u32) -> usize {
     let mut written = 0usize;
     while (n & !0x7f) != 0 {
@@ -82,10 +97,12 @@ fn write_varint(buf: &mut [u8; 5], mut n: u32) -> usize {
     written + 1
 }
 
+#[inline(always)]
 fn offset(off: usize) -> u32 {
     ((off as u32) << 2) | 3
 }
 
+#[inline(always)]
 fn copy_inline(body: &mut [u32], body_index: &mut usize, pos: &mut usize, field: &Unit) {
     let len = field.inline_len;
     body[*body_index..*body_index + len].copy_from_slice(field.inline_words());
@@ -93,40 +110,19 @@ fn copy_inline(body: &mut [u32], body_index: &mut usize, pos: &mut usize, field:
     *pos -= len;
 }
 
-fn write_padded_unit_cell(buffer: &mut Buffer, unit: &Unit, width: usize) -> Option<()> {
-    let old_len = buffer.len();
-    let mut copied_segment = [0u32; 3];
-    let copied_len =
-        if unit.inline_len == 0 && unit.segment.len <= width && unit.segment.len != 0 {
-            let start = old_len.checked_sub(unit.segment.pos)?;
-            let words = buffer.view().get(start..start + unit.segment.len)?;
-            copied_segment[..words.len()].copy_from_slice(words);
-            words.len()
-        } else {
-            0
-        };
-
-    let new_len = old_len + width;
-    let cell = buffer.expand(width);
+#[inline(always)]
+fn materialize_unit_words(unit: &Unit, buffer: &Buffer) -> Option<Vec<u32>> {
     if unit.inline_len != 0 {
-        cell[..unit.inline_len].copy_from_slice(unit.inline_words());
-        for slot in &mut cell[unit.inline_len..] {
-            *slot = 0;
-        }
-    } else if copied_len != 0 {
-        cell[..copied_len].copy_from_slice(&copied_segment[..copied_len]);
-        for slot in &mut cell[copied_len..] {
-            *slot = 0;
-        }
-    } else {
-        cell[0] = offset(new_len - unit.segment.pos);
-        for slot in &mut cell[1..] {
-            *slot = 0;
-        }
+        return Some(unit.inline_words().to_vec());
     }
-    Some(())
+    if unit.segment.len == 0 {
+        return Some(Vec::new());
+    }
+    let start = buffer.len().checked_sub(unit.segment.pos)?;
+    Some(buffer.view().get(start..start + unit.segment.len)?.to_vec())
 }
 
+#[inline(always)]
 fn best_array_size(elements: &[Unit]) -> (usize, usize) {
     let mut sizes = [0usize; 3];
     for element in elements {
@@ -157,14 +153,17 @@ fn best_array_size(elements: &[Unit]) -> (usize, usize) {
     (sizes[mode], mode + 1)
 }
 
+#[inline(always)]
 fn perfect_hash_section(size: usize) -> usize {
     ((size * 105).saturating_add(255) / 256).max(10)
 }
 
+#[inline(always)]
 fn perfect_hash_bitmap_size(section: usize) -> usize {
     ((section * 3 + 31) & !31) / 4
 }
 
+#[inline(always)]
 fn set_bit2(vec: &mut [u8], pos: usize, val: u8) {
     let shift = ((pos & 3) << 1) as u8;
     let idx = pos >> 2;
@@ -172,6 +171,7 @@ fn set_bit2(vec: &mut [u8], pos: usize, val: u8) {
     vec[idx] |= (val & 3) << shift;
 }
 
+#[inline(always)]
 fn get_bit2(vec: &[u8], pos: usize) -> u8 {
     (vec[pos >> 2] >> ((pos & 3) << 1)) & 3
 }
@@ -181,6 +181,7 @@ struct Edge {
     slots: [usize; 3],
 }
 
+#[inline(always)]
 fn peel_graph(edges: &[Edge], slot_cnt: usize) -> Option<Vec<usize>> {
     let mut adjacency = vec![Vec::<usize>::new(); slot_cnt];
     let mut degree = vec![0usize; slot_cnt];
@@ -226,6 +227,7 @@ fn peel_graph(edges: &[Edge], slot_cnt: usize) -> Option<Vec<usize>> {
     }
 }
 
+#[inline(always)]
 fn count_valid_slots(bitmap: &[u8], block: usize) -> usize {
     let start = block * 32;
     let mut count = 0usize;
@@ -237,6 +239,7 @@ fn count_valid_slots(bitmap: &[u8], block: usize) -> usize {
     count
 }
 
+#[inline(always)]
 fn locate_in_perfect_hash(index: &[u8], key: &[u8]) -> Option<usize> {
     let size = u32::from_le_bytes(index.get(..4)?.try_into().ok()?) as usize & 0x0fff_ffff;
     if size < 2 {
@@ -277,10 +280,12 @@ fn locate_in_perfect_hash(index: &[u8], key: &[u8]) -> Option<usize> {
     Some(off + rank - 1)
 }
 
+#[inline(always)]
 pub fn build_perfect_hash_index<K: AsRef<[u8]>>(keys: &[K]) -> Option<Vec<u8>> {
     Some(build_perfect_hash_index_with_positions(keys)?.0)
 }
 
+#[inline(always)]
 pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
     keys: &[K],
 ) -> Option<(Vec<u8>, Vec<usize>)> {
@@ -380,6 +385,7 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
     Some((out, positions))
 }
 
+#[inline(always)]
 pub fn fold_field(buffer: &mut Buffer, unit: &mut Unit) {
     if !unit.is_segment() || unit.segment.len >= 4 || unit.segment.pos != buffer.len() {
         return;
@@ -392,6 +398,7 @@ pub fn fold_field(buffer: &mut Buffer, unit: &mut Unit) {
     buffer.shrink(seg.len);
 }
 
+#[inline(always)]
 pub fn serialize_scalar<T: Scalar>(value: T) -> Unit {
     let mut words = [0u32; 3];
     let word_len = T::WIDTH;
@@ -403,10 +410,12 @@ pub fn serialize_scalar<T: Scalar>(value: T) -> Unit {
     }
 }
 
+#[inline(always)]
 pub fn serialize_bool(value: bool) -> Unit {
     Unit::inline(&[u32::from(value)])
 }
 
+#[inline(always)]
 pub fn serialize_bytes(bytes: &[u8], buffer: &mut Buffer) -> Option<Unit> {
     if bytes.len() >= (1usize << 30) {
         return None;
@@ -440,24 +449,28 @@ pub fn serialize_bytes(bytes: &[u8], buffer: &mut Buffer) -> Option<Unit> {
     }
 }
 
+#[inline(always)]
 pub fn serialize_str(value: &str, buffer: &mut Buffer) -> Option<Unit> {
     serialize_bytes(value.as_bytes(), buffer)
 }
 
-pub fn serialize_message(fields: &mut Vec<Unit>, buffer: &mut Buffer) -> Option<Unit> {
+#[inline(always)]
+pub fn serialize_message_at(fields: &mut [Unit], buffer: &mut Buffer, last: usize) -> Option<Unit> {
     if fields.is_empty() {
         return None;
     }
-    while matches!(fields.last(), Some(unit) if unit.is_empty()) {
-        fields.pop();
-    }
-    if fields.is_empty() {
+    let used_len = fields
+        .iter()
+        .rposition(|unit| !unit.is_empty())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    if used_len == 0 {
         let last = buffer.len();
         buffer.put(0);
         return Some(Unit::segment(last, buffer.len()));
     }
+    let fields = &mut fields[..used_len];
 
-    let last = buffer.len();
     let mut body_size = 0usize;
     let mut size = 0usize;
     for field in fields.iter().rev() {
@@ -479,7 +492,8 @@ pub fn serialize_message(fields: &mut Vec<Unit>, buffer: &mut Buffer) -> Option<
     }
 
     let head_size = 1 + section * 2;
-    let total_size = last + head_size + body_size;
+    let current_size = buffer.len();
+    let total_size = current_size + head_size + body_size;
     let block = buffer.expand(head_size + body_size);
     let (head, body) = block.split_at_mut(head_size);
     let mut body_index = 0usize;
@@ -528,7 +542,13 @@ pub fn serialize_message(fields: &mut Vec<Unit>, buffer: &mut Buffer) -> Option<
     Some(Unit::segment(last, buffer.len()))
 }
 
-pub fn serialize_array(elements: &[Unit], buffer: &mut Buffer) -> Option<Unit> {
+#[inline(always)]
+pub fn serialize_message(fields: &mut [Unit], buffer: &mut Buffer) -> Option<Unit> {
+    serialize_message_at(fields, buffer, buffer.len())
+}
+
+#[inline(always)]
+pub fn serialize_array_at(elements: &[Unit], buffer: &mut Buffer, last: usize) -> Option<Unit> {
     if elements.is_empty() {
         return Some(Unit::inline(&[1]));
     }
@@ -538,15 +558,41 @@ pub fn serialize_array(elements: &[Unit], buffer: &mut Buffer) -> Option<Unit> {
         return None;
     }
 
-    let last = buffer.len();
-    for unit in elements.iter().rev() {
-        write_padded_unit_cell(buffer, unit, width)?;
+    let mut payloads = Vec::with_capacity(size.saturating_sub(elements.len() * width));
+    let mut cells = vec![0u32; elements.len() * width];
+    let cells_len = cells.len();
+    for (index, unit) in elements.iter().enumerate() {
+        let words = materialize_unit_words(unit, buffer)?;
+        let cell = &mut cells[index * width..(index + 1) * width];
+        if words.len() <= width {
+            cell[..words.len()].copy_from_slice(&words);
+        } else {
+            let payload_start = cells_len.checked_add(payloads.len())?;
+            let cell_start = index.checked_mul(width)?;
+            cell[0] = offset(payload_start.checked_sub(cell_start)?);
+            payloads.extend_from_slice(&words);
+        }
     }
+    buffer.shrink(buffer.len().checked_sub(last)?);
+    buffer.put_words(&payloads);
+    buffer.put_words(&cells);
     buffer.put(((elements.len() as u32) << 2) | width as u32);
     Some(Unit::segment(last, buffer.len()))
 }
 
-pub fn serialize_map(index: &[u8], keys: &[Unit], values: &[Unit], buffer: &mut Buffer) -> Option<Unit> {
+#[inline(always)]
+pub fn serialize_array(elements: &[Unit], buffer: &mut Buffer) -> Option<Unit> {
+    serialize_array_at(elements, buffer, buffer.len())
+}
+
+#[inline(always)]
+pub fn serialize_map_at(
+    index: &[u8],
+    keys: &[Unit],
+    values: &[Unit],
+    buffer: &mut Buffer,
+    last: usize,
+) -> Option<Unit> {
     if keys.len() != values.len() {
         return None;
     }
@@ -562,12 +608,36 @@ pub fn serialize_map(index: &[u8], keys: &[Unit], values: &[Unit], buffer: &mut 
         return None;
     }
 
-    let last = buffer.len();
-    for (key, value) in keys.iter().zip(values).rev() {
-        for (unit, width) in [(value, value_width), (key, key_width)] {
-            write_padded_unit_cell(buffer, unit, width)?;
+    let pair_width = key_width + value_width;
+    let mut payloads = Vec::with_capacity(size.saturating_sub(keys.len() * pair_width));
+    let mut cells = vec![0u32; keys.len() * pair_width];
+    let cells_len = cells.len();
+    for index in 0..keys.len() {
+        let key_words = materialize_unit_words(&keys[index], buffer)?;
+        let value_words = materialize_unit_words(&values[index], buffer)?;
+        let cell_start = index.checked_mul(pair_width)?;
+        let (key_cell, value_cell) = cells[cell_start..cell_start + pair_width].split_at_mut(key_width);
+
+        if key_words.len() <= key_width {
+            key_cell[..key_words.len()].copy_from_slice(&key_words);
+        } else {
+            let payload_start = cells_len.checked_add(payloads.len())?;
+            key_cell[0] = offset(payload_start.checked_sub(cell_start)?);
+            payloads.extend_from_slice(&key_words);
+        }
+
+        let value_cell_start = cell_start + key_width;
+        if value_words.len() <= value_width {
+            value_cell[..value_words.len()].copy_from_slice(&value_words);
+        } else {
+            let payload_start = cells_len.checked_add(payloads.len())?;
+            value_cell[0] = offset(payload_start.checked_sub(value_cell_start)?);
+            payloads.extend_from_slice(&value_words);
         }
     }
+    buffer.shrink(buffer.len().checked_sub(last)?);
+    buffer.put_words(&payloads);
+    buffer.put_words(&cells);
 
     let head = buffer.expand(index_words);
     head.fill(0);
@@ -577,11 +647,16 @@ pub fn serialize_map(index: &[u8], keys: &[Unit], values: &[Unit], buffer: &mut 
     Some(Unit::segment(last, buffer.len()))
 }
 
+#[inline(always)]
+pub fn serialize_map(index: &[u8], keys: &[Unit], values: &[Unit], buffer: &mut Buffer) -> Option<Unit> {
+    serialize_map_at(index, keys, values, buffer, buffer.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Unit, build_perfect_hash_index, build_perfect_hash_index_with_positions, fold_field,
-        serialize_array, serialize_bool, serialize_map, serialize_message, serialize_scalar,
+        serialize_array, serialize_array_at, serialize_bool, serialize_map, serialize_message, serialize_scalar,
         serialize_str,
     };
     use crate::{ArrayView, Buffer, MapView, MessageView, StringView, ViewArray};
@@ -690,5 +765,100 @@ mod tests {
             seen.insert(super::locate_in_perfect_hash(&index, key).unwrap());
         }
         assert_eq!(seen.len(), keys.len());
+    }
+
+    #[test]
+    fn serializes_short_string_key_float_array_map_roundtrip() {
+        let keys_bytes = vec![b"lv5".to_vec(), b"lv9".to_vec()];
+        let (index, positions) = build_perfect_hash_index_with_positions(&keys_bytes).unwrap();
+
+        let mut buffer = Buffer::new();
+        let key0 = serialize_str("lv5", &mut buffer).unwrap();
+        let key1 = serialize_str("lv9", &mut buffer).unwrap();
+
+        let last = buffer.len();
+        let value0 = serialize_array_at(
+            &[
+                serialize_scalar::<f32>(51.0),
+                serialize_scalar::<f32>(52.0),
+                serialize_scalar::<f32>(53.0),
+            ],
+            &mut buffer,
+            last,
+        )
+        .unwrap();
+        let last = buffer.len();
+        let value1 = serialize_array_at(
+            &[serialize_scalar::<f32>(91.0), serialize_scalar::<f32>(92.0)],
+            &mut buffer,
+            last,
+        )
+        .unwrap();
+
+        let mut keys = vec![Unit::empty(); 2];
+        let mut values = vec![Unit::empty(); 2];
+        keys[positions[0]] = key0;
+        keys[positions[1]] = key1;
+        values[positions[0]] = value0;
+        values[positions[1]] = value1;
+        let _map = serialize_map(&index, &keys, &values, &mut buffer).unwrap();
+
+        let view = MapView::new(buffer.view()).unwrap();
+        let lv5 = view.find_str("lv5").unwrap().value().array().unwrap();
+        assert_eq!(lv5.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(), vec![51.0, 52.0, 53.0]);
+        let lv9 = view.find_str("lv9").unwrap().value().array().unwrap();
+        assert_eq!(lv9.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(), vec![91.0, 92.0]);
+    }
+
+    #[test]
+    fn serializes_multi_entry_short_string_key_float_array_map_roundtrip() {
+        let keys = ["lv1", "lv2", "lv3", "lv4", "lv5", "lv9"];
+        let key_bytes = keys.iter().map(|key| key.as_bytes().to_vec()).collect::<Vec<_>>();
+        let (index, positions) = build_perfect_hash_index_with_positions(&key_bytes).unwrap();
+
+        let values_src = [
+            vec![11.0f32, 12.0],
+            vec![21.0, 22.0],
+            vec![31.0, 32.0],
+            vec![41.0, 42.0],
+            vec![51.0, 52.0, 53.0],
+            vec![91.0, 92.0],
+        ];
+
+        let mut buffer = Buffer::new();
+        let encoded_keys = keys
+            .iter()
+            .map(|key| serialize_str(key, &mut buffer).unwrap())
+            .collect::<Vec<_>>();
+        let encoded_values = values_src
+            .iter()
+            .map(|values| {
+                let units = values
+                    .iter()
+                    .map(|value| serialize_scalar::<f32>(*value))
+                    .collect::<Vec<_>>();
+                serialize_array(&units, &mut buffer).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let mut keys = vec![Unit::empty(); positions.len()];
+        let mut values = vec![Unit::empty(); positions.len()];
+        for (idx, pos) in positions.iter().copied().enumerate() {
+            keys[pos] = encoded_keys[idx];
+            values[pos] = encoded_values[idx];
+        }
+
+        let _map = serialize_map(&index, &keys, &values, &mut buffer).unwrap();
+        let view = MapView::new(buffer.view()).unwrap();
+        for (key, expected) in ["lv1", "lv2", "lv3", "lv4", "lv5", "lv9"]
+            .into_iter()
+            .zip(values_src.iter())
+        {
+            let array = view.find_str(key).unwrap().value().array().unwrap();
+            assert_eq!(
+                array.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
+                expected.clone()
+            );
+        }
     }
 }

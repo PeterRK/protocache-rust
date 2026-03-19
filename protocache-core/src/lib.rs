@@ -1,188 +1,55 @@
-mod buffer;
-mod common;
-mod compression;
-mod error;
-mod hash;
-mod perfect_hash;
-mod read;
-mod serialize;
+//! Core ProtoCache runtime primitives.
+//!
+//! The primary public surface keeps the original module layout:
+//! - `access`
+//! - `mutable`
+//! - `serialize`
+//! - `perfect_hash`
+//! - `utils`
+//!
+//! For Rust-first integration, prefer the re-exported helper modules:
+//! - `runtime`
+//! - `mutable`
+//! - `encoding`
 
-pub use buffer::Buffer;
-pub use common::{Bytes, EnumValue, Scalar, Words};
-pub use compression::{compress, compress_into, decompress, decompress_into};
-pub use error::{CorruptionKind, ReadError};
-pub use read::{
+pub mod access;
+pub mod mutable;
+pub mod perfect_hash;
+pub mod serialize;
+pub mod utils;
+
+mod hash;
+
+pub mod runtime {
+    //! Rust-first aliases for the read-only runtime surface.
+    pub use crate::access::*;
+}
+
+pub mod encoding {
+    //! Rust-first aliases for encoding and buffer primitives.
+    pub use crate::serialize::*;
+    pub use crate::utils::{Buffer, Bytes, EnumValue, Scalar, Words};
+}
+
+pub use access::{
     ArrayIter, ArrayView, BoolArray, FieldDecode, FieldView, GeneratedDescriptor,
     GeneratedMessage, MapIter, MapKey, MapView, MessageView, PairView, ScalarArray, StringView,
-    ViewArray, ViewMap,
+    ViewArray, ViewMap, detect_array_with, detect_map_with, detect_slice_end,
 };
+pub use mutable::{
+    MutableArray, MutableArrayElement, MutableField, MutableMap, MutableMapKey, MutableMapKeyKind,
+    MutableMessage, MutableError, copy_words,
+};
+pub use perfect_hash::PerfectHashView;
 pub use serialize::{
     Segment, Unit, build_perfect_hash_index, build_perfect_hash_index_with_positions, fold_field,
-    serialize_array, serialize_bool, serialize_bytes, serialize_map, serialize_message,
-    serialize_scalar, serialize_str,
+    serialize_array, serialize_array_at, serialize_bool, serialize_bytes, serialize_map,
+    serialize_map_at, serialize_message, serialize_message_at, serialize_scalar, serialize_str,
+};
+pub use utils::{
+    Buffer, Bytes, CorruptionKind, EnumValue, ReadError, Scalar, Words, compress, compress_into,
+    decompress, decompress_into,
 };
 
-pub(crate) use hash::hash128;
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reads_scalar_message() {
-        let words = [0x0000_0100u32, 42u32];
-        let view = MessageView::new(&words).unwrap();
-        assert_eq!(view.scalar::<i32>(0), Some(42));
-        assert!(view.scalar::<i32>(1).is_none());
-    }
-
-    #[test]
-    fn reads_inline_string() {
-        let words = [0x0000_0100u32, 0x0069_6808u32];
-        let view = MessageView::new(&words).unwrap();
-        let string = view.string(0).unwrap();
-        assert_eq!(string.as_str(), Some("hi"));
-    }
-
-    #[test]
-    fn finds_map_entries_in_cpp_fixture() {
-        let bytes = include_bytes!("../../tests/fixtures/benchmark/test.pc");
-        let words = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let root = MessageView::new(&words).unwrap();
-
-        let index = root.map(25).unwrap();
-        assert_eq!(
-            index.find_str("abc-1").unwrap().value().scalar::<i32>(),
-            Some(1)
-        );
-        assert_eq!(
-            index.find_str("abc-2").unwrap().value().scalar::<i32>(),
-            Some(2)
-        );
-        assert!(index.find_str("abc-3").is_none());
-
-        let objects = root.map(26).unwrap();
-        let one = objects.find_scalar(1i32).unwrap();
-        assert_eq!(one.key().scalar::<i32>(), Some(1));
-        let object = one.value().message().unwrap();
-        assert_eq!(object.scalar::<i32>(0), Some(1));
-        assert!(objects.find_scalar(5i32).is_none());
-    }
-
-    #[test]
-    fn view_array_decodes_strings() {
-        let bytes = include_bytes!("../../tests/fixtures/benchmark/test.pc");
-        let words = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let root = MessageView::new(&words).unwrap();
-        let array = ViewArray::<StringView<'_>>::new(root.array(13).unwrap());
-        assert_eq!(array.len(), 10);
-        assert_eq!(array.get(0).unwrap().as_str(), Some("abc"));
-        assert_eq!(array.get(1).unwrap().as_str(), Some("apple"));
-    }
-
-    #[test]
-    fn view_map_decodes_entries() {
-        let bytes = include_bytes!("../../tests/fixtures/benchmark/test.pc");
-        let words = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let root = MessageView::new(&words).unwrap();
-
-        let index = ViewMap::<StringView<'_>, i32>::new(root.map(25).unwrap());
-        assert_eq!(index.len(), 6);
-        let (key, value) = index.find_str("abc-1").unwrap();
-        assert_eq!(key.as_str(), Some("abc-1"));
-        assert_eq!(value, 1);
-
-        let objects = ViewMap::<i32, MessageView<'_>>::new(root.map(26).unwrap());
-        let (key, value) = objects.find_scalar(1).unwrap();
-        assert_eq!(key, 1);
-        assert_eq!(value.scalar::<i32>(0), Some(1));
-    }
-
-    #[test]
-    fn empty_views_are_rejected() {
-        assert!(MessageView::new(&[]).is_none());
-        assert!(StringView::new(&[]).is_none());
-        assert!(ArrayView::new(&[]).is_none());
-        assert!(MapView::new(&[]).is_none());
-    }
-
-    #[test]
-    fn invalid_map_header_is_rejected() {
-        let words = [0u32];
-        assert!(MapView::new(&words).is_none());
-    }
-
-    #[test]
-    fn corrupt_message_header_is_rejected() {
-        let bytes = include_bytes!("../../tests/fixtures/benchmark/test.pc");
-        let mut words = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        words[0] = u32::MAX;
-        assert!(MessageView::new(&words).is_none());
-    }
-
-    #[test]
-    fn detect_returns_precise_object_ranges() {
-        let words = [0x0000_0100u32, 0x0069_6808u32];
-        let root = MessageView::new(&words).unwrap();
-
-        assert_eq!(MessageView::detect(&words).unwrap(), &words[..2]);
-        assert_eq!(root.field(0).unwrap().detect_scalar().unwrap(), &words[1..2]);
-
-        let string_msg = [0x0000_0100u32, 0x0000_0007u32, 0x0069_6808u32];
-        let root = MessageView::new(&string_msg).unwrap();
-        assert_eq!(root.field(0).unwrap().detect_string().unwrap(), &string_msg[2..3]);
-        assert_eq!(StringView::detect(&string_msg[2..]).unwrap(), &string_msg[2..3]);
-    }
-
-    #[test]
-    fn detect_handles_fixture_array_and_map_payloads() {
-        let bytes = include_bytes!("../../tests/fixtures/benchmark/test.pc");
-        let words = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let root = MessageView::new(&words).unwrap();
-
-        let strv = root.field(13).unwrap().detect_array().unwrap();
-        assert_eq!(ArrayView::detect(strv).unwrap(), strv);
-        assert_eq!(ArrayView::detect_len(strv).unwrap(), strv.len());
-
-        let index = root.field(25).unwrap().detect_map().unwrap();
-        assert_eq!(MapView::detect(index).unwrap(), index);
-    }
-
-    #[test]
-    fn compression_roundtrip_preserves_payload() {
-        let src = b"\0\0\0\0abcd\xff\xff\xffefgh\0";
-        let compressed = compress(src);
-        let restored = decompress(&compressed).unwrap();
-        assert_eq!(restored, src);
-    }
-
-    #[test]
-    fn compression_into_reuses_buffers() {
-        let src = b"\0\0\0\0abcd\xff\xff\xffefgh\0";
-        let mut compressed = Vec::with_capacity(128);
-        let compressed_capacity = compressed.capacity();
-        compress_into(src, &mut compressed);
-        assert_eq!(compressed.capacity(), compressed_capacity);
-
-        let mut restored = Vec::with_capacity(128);
-        let restored_capacity = restored.capacity();
-        decompress_into(&compressed, &mut restored).unwrap();
-        assert_eq!(restored, src);
-        assert_eq!(restored.capacity(), restored_capacity);
-    }
-}
+mod tests;

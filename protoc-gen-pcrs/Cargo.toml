@@ -7,7 +7,7 @@ edition = "2024"
 prost = "0.13.5"
 prost-types = "0.13.5"
 protocache-core = { path = "../protocache-core" }
-protocache-schema = { path = "../protocache-schema" }
+protocache-extension = { path = "../protocache-extension" }
 
 [dev-dependencies]
-protocache-mutable = { path = "../protocache-mutable" }
+protocache-extension = { path = "../protocache-extension" }

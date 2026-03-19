@@ -1,18 +1,27 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::borrow::Borrow;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
 
 use prost::Message;
-use protocache_core::{
-    ArrayView, FieldView, MapView, MessageView, StringView, ViewArray, compress_into,
-    decompress_into,
+use prost_reflect::{
+    DescriptorError as ReflectDescriptorError,
+    DescriptorPool as ReflectDescriptorPool, DynamicMessage, FieldDescriptor as ReflectFieldDescriptor,
+    Kind as ReflectKind, MapKey as ReflectMapKey, Value as ReflectValue, prost_types::FileDescriptorSet,
 };
-use protocache_mutable::{MessageMut, serialize_protobuf_bytes_into_buffer};
-use protocache_schema::load_reflect_descriptor_pool_from_proto_file;
+use protocache_core::{
+    ArrayView, FieldView, MapView, MessageView, MutableError, PerfectHashView, ReadError,
+    StringView, ViewArray, compress_into, decompress_into,
+};
+use protocache_extension::{
+    reflection::{Descriptor as PcDescriptor, DescriptorPool as PcDescriptorPool, Field as PcField,
+    FieldType as PcFieldType},
+    utils::{ProtoError, parse_proto_file, serialize_dynamic_into_buffer},
+};
 
+#[allow(dead_code, unused_imports, warnings)]
 mod pb {
     include!(concat!(env!("OUT_DIR"), "/test.rs"));
 }
@@ -29,37 +38,187 @@ mod fb_generated {
     include!(concat!(env!("OUT_DIR"), "/test_generated.rs"));
 }
 
+#[allow(
+    dead_code,
+    unused_imports,
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    warnings
+)]
+mod pcrs_generated {
+    include!(concat!(env!("OUT_DIR"), "/test_pc.rs"));
+}
+
 const DEFAULT_LOOPS: usize = 1_000_000;
+
+type BenchResult<T> = Result<T, BenchError>;
+
+#[derive(Debug)]
+enum BenchError {
+    Message(&'static str),
+    Owned(String),
+    Io(std::io::Error),
+    Decode(prost::DecodeError),
+    Proto(ProtoError),
+    ReflectDescriptor(ReflectDescriptorError),
+    Mutable(MutableError),
+    Read(ReadError),
+}
+
+impl From<&'static str> for BenchError {
+    fn from(value: &'static str) -> Self {
+        Self::Message(value)
+    }
+}
+
+impl From<String> for BenchError {
+    fn from(value: String) -> Self {
+        Self::Owned(value)
+    }
+}
+
+impl From<std::io::Error> for BenchError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<prost::DecodeError> for BenchError {
+    fn from(value: prost::DecodeError) -> Self {
+        Self::Decode(value)
+    }
+}
+
+impl From<ProtoError> for BenchError {
+    fn from(value: ProtoError) -> Self {
+        Self::Proto(value)
+    }
+}
+
+impl From<ReflectDescriptorError> for BenchError {
+    fn from(value: ReflectDescriptorError) -> Self {
+        Self::ReflectDescriptor(value)
+    }
+}
+
+impl From<MutableError> for BenchError {
+    fn from(value: MutableError) -> Self {
+        Self::Mutable(value)
+    }
+}
+
+impl From<ReadError> for BenchError {
+    fn from(value: ReadError) -> Self {
+        Self::Read(value)
+    }
+}
+
+impl std::fmt::Display for BenchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(value) => f.write_str(value),
+            Self::Owned(value) => f.write_str(value),
+            Self::Io(err) => err.fmt(f),
+            Self::Decode(err) => err.fmt(f),
+            Self::Proto(err) => err.fmt(f),
+            Self::ReflectDescriptor(err) => err.fmt(f),
+            Self::Mutable(err) => err.fmt(f),
+            Self::Read(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for BenchError {}
 
 #[derive(Default)]
 struct Junk {
     u32_sum: u32,
+    f32_sum: f32,
     u64_sum: u64,
-    f32_bits_sum: u32,
-    f64_bits_sum: u64,
+    f64_sum: f64,
 }
 
 impl Junk {
     fn add_f32(&mut self, value: f32) {
-        self.f32_bits_sum = self.f32_bits_sum.wrapping_add(value.to_bits());
+        self.f32_sum += value;
     }
 
     fn add_f64(&mut self, value: f64) {
-        self.f64_bits_sum = self.f64_bits_sum.wrapping_add(value.to_bits());
+        self.f64_sum += value;
     }
 
     fn fuse(&self) -> u64 {
-        self.f64_bits_sum ^ ((self.f32_bits_sum as u64) << 32 | self.u32_sum as u64) ^ self.u64_sum
+        (self.f64_sum + self.f32_sum as f64).to_bits() ^ self.u64_sum.wrapping_add(self.u32_sum as u64)
     }
 }
 
 struct BenchConfig {
     loops: usize,
+    extra: bool,
+}
+
+#[derive(Clone)]
+struct ReflectDescriptorPlan {
+    fields: Vec<ReflectFieldPlan>,
+}
+
+#[derive(Clone)]
+struct PbReflectDescriptorPlan {
+    fields: Vec<PbReflectFieldPlan>,
+}
+
+#[derive(Clone)]
+struct ReflectFieldPlan {
+    id: usize,
+    repeated: bool,
+    key: Option<PcFieldType>,
+    value: ReflectValuePlan,
+}
+
+#[derive(Clone)]
+enum ReflectValuePlan {
+    Message {
+        alias: Option<Box<ReflectFieldPlan>>,
+        descriptor: Option<Box<ReflectDescriptorPlan>>,
+    },
+    Bytes,
+    String,
+    Double,
+    Float,
+    Uint64,
+    Uint32,
+    Int64,
+    Int32,
+    Bool,
+    Enum,
+}
+
+#[derive(Clone)]
+struct PbReflectFieldPlan {
+    descriptor: ReflectFieldDescriptor,
+    value: PbReflectValuePlan,
+}
+
+#[derive(Clone)]
+enum PbReflectValuePlan {
+    Message(Box<PbReflectDescriptorPlan>),
+    Bytes,
+    String,
+    Double,
+    Float,
+    Uint64,
+    Uint32,
+    Int64,
+    Int32,
+    Bool,
+    Enum,
 }
 
 impl BenchConfig {
     fn from_args() -> Result<Self, String> {
         let mut loops = DEFAULT_LOOPS;
+        let mut extra = false;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -69,39 +228,47 @@ impl BenchConfig {
                         .parse()
                         .map_err(|_| format!("invalid --loops value: {value}"))?;
                 }
+                "--extra" => {
+                    extra = true;
+                }
                 "--help" | "-h" => {
-                    println!("Usage: cargo run -p protocache-benchmark --release -- [--loops N]");
+                    println!("Usage: cargo run -p protocache-benchmark --release -- [--loops N] [--extra]");
                     std::process::exit(0);
                 }
                 _ => return Err(format!("unknown argument: {arg}")),
             }
         }
-        Ok(Self { loops })
+        Ok(Self { loops, extra })
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> BenchResult<()> {
     let config = BenchConfig::from_args().map_err(|err| format!("argument error: {err}"))?;
-    let fixture_root = repo_root().join("tests/fixtures");
-    let fixture_dir = fixture_root.join("benchmark");
-    let schema_path = fixture_root.join("proto/benchmark-test.proto");
+    let fixture_dir = repo_root().join("tests/fixtures/benchmark");
+    let schema_path = repo_root().join("tests/fixtures/proto/test.proto");
 
     let protobuf_raw = fs::read(fixture_dir.join("test.pb"))?;
     let flatbuffers_raw = fs::read(fixture_dir.join("test.fb"))?;
     let protocache_raw = fs::read(fixture_dir.join("test.pc"))?;
     let protocache_words = bytes_to_words(&protocache_raw);
+    let protocache_dynamic = load_benchmark_dynamic_message(&protobuf_raw, &schema_path)?;
 
     benchmark_protobuf(&protobuf_raw, config.loops)?;
     benchmark_flatbuffers(&flatbuffers_raw, config.loops)?;
-    benchmark_flatbuffers_unchecked(&flatbuffers_raw, config.loops)?;
     benchmark_protocache(&protocache_words, &protocache_raw, config.loops)?;
+    benchmark_protobuf_reflect(&schema_path, &protobuf_raw, config.loops)?;
+    benchmark_protocache_reflect(&schema_path, &protocache_words, config.loops)?;
+    if config.extra {
+        benchmark_mutable_map_string_lookup(&protocache_words, config.loops)?;
+        benchmark_mutable_message_from_words_copy(&protocache_words, config.loops)?;
+        benchmark_perfect_hash_locate(&protocache_words, config.loops)?;
+    }
 
     println!("========serialize========");
     benchmark_protobuf_serialize(&protobuf_raw, config.loops)?;
-    benchmark_protobuf_to_protocache_serialize(&protobuf_raw, &schema_path, config.loops)?;
-    benchmark_protocache_serialize_aligned(&schema_path, &protocache_words, config.loops, false)?;
-    benchmark_protocache_serialize_aligned(&schema_path, &protocache_words, config.loops, true)?;
-    benchmark_serialize_micro(&protobuf_raw, &schema_path, &protocache_words, config.loops)?;
+    benchmark_dynamic_to_protocache_serialize(&protocache_dynamic, config.loops)?;
+    benchmark_protocache_generated_serialize(&protocache_words, false, config.loops)?;
+    benchmark_protocache_generated_serialize(&protocache_words, true, config.loops)?;
 
     println!("========compress========");
     benchmark_compress("pb", &protobuf_raw, config.loops)?;
@@ -124,6 +291,39 @@ fn bytes_to_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+fn load_descriptor_pool_from_proto_file(
+    path: &Path,
+) -> BenchResult<PcDescriptorPool> {
+    let file = parse_proto_file(path)?;
+    let mut pool = PcDescriptorPool::default();
+    pool.register(&file)
+        .map_err(|err| format!("{err:?}"))?;
+    Ok(pool)
+}
+
+fn load_reflect_descriptor_pool_from_proto_file(
+    path: &Path,
+) -> BenchResult<ReflectDescriptorPool> {
+    let file = parse_proto_file(path)?;
+    Ok(ReflectDescriptorPool::from_file_descriptor_set(FileDescriptorSet {
+        file: vec![file],
+    })?)
+}
+
+fn load_benchmark_dynamic_message(
+    raw: &[u8],
+    schema_path: &Path,
+) -> BenchResult<DynamicMessage> {
+    let pool = load_reflect_descriptor_pool_from_proto_file(schema_path)?;
+    let descriptor = pool
+        .get_message_by_name("test.Main")
+        .ok_or("missing test.Main descriptor")?;
+    let prost_root = pb::Main::decode(raw)?;
+    let mut root = DynamicMessage::new(descriptor);
+    root.transcode_from(&prost_root)?;
+    Ok(root)
+}
+
 fn junk_hash_bytes(data: &[u8]) -> u32 {
     let mut out = 0u32;
     let mut chunks = data.chunks_exact(4);
@@ -138,11 +338,24 @@ where
     I: IntoIterator<Item = T>,
     T: Borrow<i8>,
 {
-    let bytes = data.into_iter().map(|v| *v.borrow() as u8).collect::<Vec<_>>();
-    junk_hash_bytes(&bytes)
+    let mut out = 0u32;
+    let mut word = 0u32;
+    let mut shift = 0usize;
+
+    for value in data {
+        word |= u32::from(*value.borrow() as u8) << shift;
+        shift += 8;
+        if shift == 32 {
+            out ^= word;
+            word = 0;
+            shift = 0;
+        }
+    }
+
+    out
 }
 
-fn benchmark_protobuf(raw: &[u8], loops: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn benchmark_protobuf(raw: &[u8], loops: usize) -> BenchResult<()> {
     let mut junk = Junk::default();
     let start = Instant::now();
     for _ in 0..loops {
@@ -153,31 +366,14 @@ fn benchmark_protobuf(raw: &[u8], loops: usize) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn benchmark_flatbuffers(raw: &[u8], loops: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let mut junk = Junk::default();
-    let start = Instant::now();
-    for _ in 0..loops {
-        let root = fb_generated::test::root_as_main(raw)?;
-        traverse_fb_main(root, &mut junk);
-    }
-    print_access_result("flatbuffers", raw.len(), start.elapsed(), loops, junk.fuse());
-    Ok(())
-}
-
-fn benchmark_flatbuffers_unchecked(raw: &[u8], loops: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn benchmark_flatbuffers(raw: &[u8], loops: usize) -> BenchResult<()> {
     let mut junk = Junk::default();
     let start = Instant::now();
     for _ in 0..loops {
         let root = unsafe { fb_generated::test::root_as_main_unchecked(raw) };
         traverse_fb_main(root, &mut junk);
     }
-    print_access_result(
-        "flatbuffers-unchecked",
-        raw.len(),
-        start.elapsed(),
-        loops,
-        junk.fuse(),
-    );
+    print_access_result("flatbuffers", raw.len(), start.elapsed(), loops, junk.fuse());
     Ok(())
 }
 
@@ -185,7 +381,7 @@ fn benchmark_protocache(
     words: &[u32],
     raw: &[u8],
     loops: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> BenchResult<()> {
     let mut junk = Junk::default();
     let start = Instant::now();
     for _ in 0..loops {
@@ -196,7 +392,105 @@ fn benchmark_protocache(
     Ok(())
 }
 
-fn benchmark_protobuf_serialize(raw: &[u8], loops: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn benchmark_protocache_reflect(
+    schema_path: &Path,
+    words: &[u32],
+    loops: usize,
+) -> BenchResult<()> {
+    let pool = load_descriptor_pool_from_proto_file(schema_path)?;
+    let descriptor_name = "test.Main";
+    let descriptor = pool.find(descriptor_name).ok_or("missing test.Main descriptor")?;
+    let plan = build_reflect_descriptor_plan(&pool, descriptor_name, descriptor)?;
+
+    let mut junk = Junk::default();
+    let start = Instant::now();
+    for _ in 0..loops {
+        let root = MessageView::new(words).ok_or("invalid protocache fixture")?;
+        traverse_pc_reflect_descriptor(&plan, root, &mut junk)?;
+    }
+    print_reflect_result("protocache-reflect", start.elapsed(), junk.fuse());
+    Ok(())
+}
+
+fn benchmark_protobuf_reflect(
+    schema_path: &Path,
+    raw: &[u8],
+    loops: usize,
+) -> BenchResult<()> {
+    let pool = load_reflect_descriptor_pool_from_proto_file(schema_path)?;
+    let descriptor = pool
+        .get_message_by_name("test.Main")
+        .ok_or("missing test.Main reflect descriptor")?;
+    let plan = build_pb_reflect_descriptor_plan(&descriptor);
+
+    let mut junk = Junk::default();
+    let start = Instant::now();
+    for _ in 0..loops {
+        let root = DynamicMessage::decode(descriptor.clone(), raw)?;
+        traverse_pb_reflect_descriptor(&plan, &root, &mut junk)?;
+    }
+    print_reflect_result("protobuf-reflect", start.elapsed(), junk.fuse());
+    Ok(())
+}
+
+fn benchmark_mutable_map_string_lookup(
+    words: &[u32],
+    loops: usize,
+) -> BenchResult<()> {
+    let mut root =
+        pcrs_generated::test::MainMutable::from_words(words).ok_or("invalid protocache fixture")?;
+    let arrays = root.arrays();
+
+    let mut owned_junk = 0u64;
+    let start = Instant::now();
+    for _ in 0..loops {
+        let key = "lv5".to_owned();
+        let values = arrays.get(&key).ok_or("missing lv5 array")?;
+        owned_junk = owned_junk.wrapping_add(values.len() as u64);
+    }
+    print_reflect_result("mapex-string-get-owned", start.elapsed(), owned_junk);
+
+    let mut borrowed_junk = 0u64;
+    let start = Instant::now();
+    for _ in 0..loops {
+        let values = arrays.get("lv5").ok_or("missing lv5 array")?;
+        borrowed_junk = borrowed_junk.wrapping_add(values.len() as u64);
+    }
+    print_reflect_result("mapex-string-get-borrowed", start.elapsed(), borrowed_junk);
+    Ok(())
+}
+
+fn benchmark_mutable_message_from_words_copy(words: &[u32], loops: usize) -> BenchResult<()> {
+    let mut junk = 0u64;
+    let start = Instant::now();
+    for _ in 0..loops {
+        let root =
+            pcrs_generated::test::MainMutable::from_words(words).ok_or("invalid protocache fixture")?;
+        junk = junk.wrapping_add(root.has_field(0) as u64);
+    }
+    print_reflect_result("mutable-message-from-words-copy", start.elapsed(), junk);
+    Ok(())
+}
+
+fn benchmark_perfect_hash_locate(words: &[u32], loops: usize) -> BenchResult<()> {
+    let root = MessageView::new(words).ok_or("invalid protocache fixture")?;
+    let map_words = root
+        .field(25)
+        .and_then(FieldView::object_words)
+        .ok_or("missing index map words")?;
+    let index = PerfectHashView::new(words_as_bytes(map_words))?;
+
+    let mut junk = 0u64;
+    let start = Instant::now();
+    for _ in 0..loops {
+        junk = junk.wrapping_add(index.locate(b"abc-1").ok_or("missing abc-1")? as u64);
+        junk = junk.wrapping_add(index.locate(b"abc-2").ok_or("missing abc-2")? as u64);
+    }
+    print_reflect_result("perfect-hash-locate", start.elapsed(), junk);
+    Ok(())
+}
+
+fn benchmark_protobuf_serialize(raw: &[u8], loops: usize) -> BenchResult<()> {
     let root = pb::Main::decode(raw)?;
     let mut total_size = 0usize;
     let start = Instant::now();
@@ -208,29 +502,56 @@ fn benchmark_protobuf_serialize(raw: &[u8], loops: usize) -> Result<(), Box<dyn 
     Ok(())
 }
 
-fn benchmark_protocache_serialize_aligned(
-    schema_path: &Path,
-    words: &[u32],
+fn benchmark_dynamic_to_protocache_serialize(
+    root: &DynamicMessage,
     loops: usize,
+) -> BenchResult<()> {
+    let mut total_size = 0usize;
+    let mut buffer = protocache_core::Buffer::new();
+    let start = Instant::now();
+    for _ in 0..loops {
+        let encoded = serialize_dynamic_into_buffer(root, &mut buffer)?;
+        total_size += encoded.len();
+    }
+    print_throughput_result(
+        "protocache-serialize",
+        start.elapsed(),
+        loops,
+        total_size,
+    );
+    Ok(())
+}
+
+fn benchmark_protocache_generated_serialize(
+    words: &[u32],
     partly: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut root = MessageMut::from_proto_file(schema_path, "test.Main", words)
-        .map_err(|err| format!("failed to open mutable protocache root: {err:?}"))?;
+    loops: usize,
+) -> BenchResult<()> {
+    let mut root =
+        pcrs_generated::test::MainMutable::from_words(words).ok_or("invalid protocache fixture")?;
 
     if partly {
-        touch_protocache_partly(&mut root)?;
+        let _ = root.i32();
+        let _ = root.u32();
+        let _ = root.i64();
+        let _ = root.u64();
+        let _ = root.flag();
+        let _ = root.mode();
+        let _ = root.str();
+        let _ = root.data();
+        let _ = root.f32();
+        let _ = root.f64();
     } else {
-        touch_protocache_fully(&mut root)?;
+        let mut junk = Junk::default();
+        traverse_pc_mutable_main(&mut root, &mut junk);
     }
 
     let mut total_size = 0usize;
     let mut buffer = protocache_core::Buffer::new();
     let start = Instant::now();
     for _ in 0..loops {
-        let encoded = root
-            .serialize_into_buffer(&mut buffer)
-            .map_err(|err| format!("failed to serialize protocache words into reusable buffer: {err:?}"))?;
-        total_size += encoded.len() * std::mem::size_of::<u32>();
+        let encoded = root.serialize_into_buffer(&mut buffer)?;
+        total_size += encoded.len();
     }
     print_throughput_result(
         if partly {
@@ -245,185 +566,106 @@ fn benchmark_protocache_serialize_aligned(
     Ok(())
 }
 
-fn benchmark_protobuf_to_protocache_serialize(
-    raw: &[u8],
-    schema_path: &Path,
-    loops: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let pool = load_reflect_descriptor_pool_from_proto_file(schema_path)?;
-    let descriptor = pool
-        .get_message_by_name("test.Main")
-        .ok_or("missing test.Main descriptor")?;
-
-    let mut total_size = 0usize;
-    let mut buffer = protocache_core::Buffer::new();
-    let start = Instant::now();
-    for _ in 0..loops {
-        let encoded = serialize_protobuf_bytes_into_buffer(descriptor.clone(), raw, &mut buffer)?;
-        total_size += encoded.len() * std::mem::size_of::<u32>();
-    }
-    print_throughput_result(
-        "protobuf-to-protocache",
-        start.elapsed(),
-        loops,
-        total_size,
-    );
-    Ok(())
+fn traverse_pc_mutable_small(root: &mut pcrs_generated::test::SmallMutable, junk: &mut Junk) {
+    junk.u32_sum = junk
+        .u32_sum
+        .wrapping_add(*root.i32() as u32)
+        .wrapping_add(u32::from(*root.flag()));
+    junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(root.str().as_bytes()));
 }
 
-fn benchmark_serialize_micro(
-    protobuf_raw: &[u8],
-    schema_path: &Path,
-    protocache_words: &[u32],
-    loops: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let pb_root = pb::Main::decode(protobuf_raw)?;
-    let reflect_pool = load_reflect_descriptor_pool_from_proto_file(schema_path)?;
-    let reflect_descriptor = reflect_pool
-        .get_message_by_name("test.Main")
-        .ok_or("missing test.Main descriptor")?;
-    let pc_root = MessageMut::from_proto_file(schema_path, "test.Main", protocache_words)
-        .map_err(|err| format!("failed to open mutable protocache root: {err:?}"))?;
+fn traverse_pc_mutable_main(root: &mut pcrs_generated::test::MainMutable, junk: &mut Junk) {
+    junk.u32_sum = junk
+        .u32_sum
+        .wrapping_add(*root.i32() as u32)
+        .wrapping_add(*root.u32())
+        .wrapping_add(u32::from(*root.flag()))
+        .wrapping_add(*root.mode() as u32);
+    junk.u32_sum = junk
+        .u32_sum
+        .wrapping_add(*root.t_i32() as u32)
+        .wrapping_add(*root.t_s32() as u32)
+        .wrapping_add(*root.t_u32());
+    for value in root.i32v().iter() {
+        junk.u32_sum = junk.u32_sum.wrapping_add(*value as u32);
+    }
+    for value in root.flags().iter() {
+        junk.u32_sum = junk.u32_sum.wrapping_add(u32::from(*value));
+    }
+    junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(root.str().as_bytes()));
+    junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(root.data()));
+    for value in root.strv().iter() {
+        junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(value.as_bytes()));
+    }
+    for value in root.datav().iter() {
+        junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(value));
+    }
 
-    let sample_loops = loops.clamp(1_000, 50_000);
-    let rounds = 7usize;
+    junk.u64_sum = junk
+        .u64_sum
+        .wrapping_add(*root.i64() as u64)
+        .wrapping_add(*root.u64())
+        .wrapping_add(*root.t_i64() as u64)
+        .wrapping_add(*root.t_s64() as u64)
+        .wrapping_add(*root.t_u64());
+    for value in root.u64v().iter() {
+        junk.u64_sum = junk.u64_sum.wrapping_add(*value);
+    }
 
-    let (pb_times, pb_total) = collect_samples(rounds, || {
-        let mut total_size = 0usize;
-        let start = Instant::now();
-        for _ in 0..sample_loops {
-            total_size += pb_root.encode_to_vec().len();
+    junk.add_f32(*root.f32());
+    for value in root.f32v().iter() {
+        junk.add_f32(*value);
+    }
+
+    junk.add_f64(*root.f64());
+    for value in root.f64v().iter() {
+        junk.add_f64(*value);
+    }
+
+    traverse_pc_mutable_small(root.object(), junk);
+    for value in root.objectv().iter_mut() {
+        traverse_pc_mutable_small(value, junk);
+    }
+
+    for (key, value) in root.index().iter() {
+        junk.u32_sum = junk
+            .u32_sum
+            .wrapping_add(junk_hash_bytes(key.as_bytes()))
+            .wrapping_add(*value as u32);
+    }
+
+    let object_keys = root.objects().iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    for key in object_keys {
+        junk.u32_sum = junk.u32_sum.wrapping_add(key as u32);
+        traverse_pc_mutable_small(root.objects().get_mut(&key).unwrap(), junk);
+    }
+
+    for row in root.matrix().iter() {
+        for value in row.iter() {
+            junk.add_f32(*value);
         }
-        (start.elapsed().as_micros(), total_size)
-    });
-
-    let (pc_times, pc_total) = collect_samples_result(rounds, || {
-        let mut total_size = 0usize;
-        let start = Instant::now();
-        for _ in 0..sample_loops {
-            total_size += pc_root
-                .serialize_words()
-                .map(|words| words.len() * std::mem::size_of::<u32>())
-                .map_err(|err| format!("failed to serialize protocache words: {err:?}"))?;
+    }
+    for map in root.vector().iter() {
+        for (key, value) in map.iter() {
+            junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(key.as_bytes()));
+            for item in value.iter() {
+                junk.add_f32(*item);
+            }
         }
-        Ok::<_, String>((start.elapsed().as_micros(), total_size))
-    })?;
-
-    let (pc_reuse_times, pc_reuse_total) = collect_samples_result(rounds, || {
-        let mut total_size = 0usize;
-        let mut buffer = protocache_core::Buffer::new();
-        let start = Instant::now();
-        for _ in 0..sample_loops {
-            total_size += pc_root
-                .serialize_into_buffer(&mut buffer)
-                .map(|words| words.len() * std::mem::size_of::<u32>())
-                .map_err(|err| format!("failed to serialize protocache words into reusable buffer: {err:?}"))?;
+    }
+    for (key, value) in root.arrays().iter() {
+        junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(key.as_bytes()));
+        for item in value.iter() {
+            junk.add_f32(*item);
         }
-        Ok::<_, String>((start.elapsed().as_micros(), total_size))
-    })?;
-
-    let (pb_to_pc_times, pb_to_pc_total) = collect_samples_result(rounds, || {
-        let mut total_size = 0usize;
-        let mut buffer = protocache_core::Buffer::new();
-        let start = Instant::now();
-        for _ in 0..sample_loops {
-            total_size += serialize_protobuf_bytes_into_buffer(
-                reflect_descriptor.clone(),
-                protobuf_raw,
-                &mut buffer,
-            )
-                .map(|words| words.len() * std::mem::size_of::<u32>())
-                .map_err(|err| err.to_string())?;
-        }
-        Ok::<_, String>((start.elapsed().as_micros(), total_size))
-    })?;
-
-    println!("========serialize-micro========");
-    print_sample_stats("protobuf-serialize-micro", sample_loops, &pb_times, pb_total);
-    print_sample_stats(
-        "protobuf-to-protocache-micro",
-        sample_loops,
-        &pb_to_pc_times,
-        pb_to_pc_total,
-    );
-    print_sample_stats("protocache-serialize-micro", sample_loops, &pc_times, pc_total);
-    print_sample_stats(
-        "protocache-serialize-reuse-micro",
-        sample_loops,
-        &pc_reuse_times,
-        pc_reuse_total,
-    );
-    Ok(())
-}
-
-fn touch_protocache_partly(root: &mut MessageMut<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    for field in [
-        "i32", "u32", "i64", "u64", "flag", "mode", "str", "data", "f32", "f64",
-    ] {
-        root.decode_field(field)
-            .map_err(|err| format!("failed to decode field {field}: {err:?}"))?;
     }
-    Ok(())
-}
-
-fn touch_protocache_fully(root: &mut MessageMut<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    for field in [
-        "i32", "u32", "i64", "u64", "flag", "mode", "str", "data", "f32", "f64", "object", "i32v",
-        "u64v", "strv", "datav", "f32v", "f64v", "flags", "objectv", "t_u32", "t_i32", "t_s32",
-        "t_u64", "t_i64", "t_s64", "index", "objects", "matrix", "vector", "arrays",
-    ] {
-        root.decode_field(field)
-            .map_err(|err| format!("failed to decode field {field}: {err:?}"))?;
-    }
-    Ok(())
-}
-
-fn collect_samples<F>(rounds: usize, mut run: F) -> (Vec<u128>, usize)
-where
-    F: FnMut() -> (u128, usize),
-{
-    let mut samples = Vec::with_capacity(rounds);
-    let mut total_size = 0usize;
-    for _ in 0..rounds {
-        let (elapsed_us, size) = run();
-        total_size = size;
-        samples.push(elapsed_us);
-    }
-    (samples, total_size)
-}
-
-fn collect_samples_result<F, E>(rounds: usize, mut run: F) -> Result<(Vec<u128>, usize), E>
-where
-    F: FnMut() -> Result<(u128, usize), E>,
-{
-    let mut samples = Vec::with_capacity(rounds);
-    let mut total_size = 0usize;
-    for _ in 0..rounds {
-        let (elapsed_us, size) = run()?;
-        total_size = size;
-        samples.push(elapsed_us);
-    }
-    Ok((samples, total_size))
-}
-
-fn print_sample_stats(name: &str, loops: usize, samples: &[u128], total_size: usize) {
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    let best = sorted[0];
-    let median = sorted[sorted.len() / 2];
-    let best_ns = nanos_per_op(best * 1_000, loops);
-    let median_ns = nanos_per_op(median * 1_000, loops);
-    println!(
-        "{name}: loops={loops} best={best}us ({best_ns:.1}ns/op) median={median}us ({median_ns:.1}ns/op) {:x}",
-        total_size
-    );
 }
 
 fn benchmark_compress(
     name: &str,
     raw: &[u8],
     loops: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> BenchResult<()> {
     let mut compressed = Vec::new();
     let start = Instant::now();
     for _ in 0..loops {
@@ -450,50 +692,38 @@ fn benchmark_compress(
 
 fn print_access_result(name: &str, bytes: usize, elapsed: Duration, loops: usize, fuse: u64) {
     println!(
-        "{name}: {bytes}B {} {:.1}ns/op {fuse:016x}",
-        format_duration(elapsed),
-        nanos_per_op(elapsed.as_nanos(), loops),
+        "{name}: {bytes}B {} {fuse:016x}",
+        format_millis(elapsed, loops),
     );
 }
 
 fn print_throughput_result(name: &str, elapsed: Duration, loops: usize, total_size: usize) {
     println!(
-        "{name}: {} {:.1}ns/op {:x}",
-        format_duration(elapsed),
-        nanos_per_op(elapsed.as_nanos(), loops),
+        "{name}: {} {:x}",
+        format_millis(elapsed, loops),
         total_size
     );
 }
 
 fn print_size_result(name: &str, size: usize, elapsed: Duration, loops: usize) {
     println!(
-        "{name}: {size}B {} {:.1}ns/op",
-        format_duration(elapsed),
-        nanos_per_op(elapsed.as_nanos(), loops),
+        "{name}: {size}B {}",
+        format_millis(elapsed, loops),
     );
 }
 
 fn print_duration_result(name: &str, elapsed: Duration, loops: usize) {
-    println!(
-        "{name}: {} {:.1}ns/op",
-        format_duration(elapsed),
-        nanos_per_op(elapsed.as_nanos(), loops),
-    );
+    println!("{name}: {}", format_millis(elapsed, loops));
 }
 
-fn nanos_per_op(total_ns: u128, loops: usize) -> f64 {
-    total_ns as f64 / loops.max(1) as f64
+fn print_reflect_result(name: &str, elapsed: Duration, fuse: u64) {
+    println!("{name}: {}ms {fuse:016x}", elapsed.as_millis());
 }
 
-fn format_duration(elapsed: Duration) -> String {
-    let total_ns = elapsed.as_nanos();
-    if total_ns < 1_000 {
-        format!("{total_ns}ns")
-    } else if total_ns < 1_000_000 {
-        format!("{:.1}us", total_ns as f64 / 1_000.0)
-    } else {
-        format!("{:.3}ms", total_ns as f64 / 1_000_000.0)
-    }
+fn format_millis(elapsed: Duration, _loops: usize) -> String {
+    let ms = elapsed.as_secs_f64() * 1_000.0;
+    let total = ms.round() as u128;
+    format!("{total}ms")
 }
 
 fn traverse_pb_small(root: &pb::Small, junk: &mut Junk) {
@@ -742,7 +972,7 @@ fn traverse_fb_main(root: fb_generated::test::Main<'_>, junk: &mut Junk) {
     }
 }
 
-fn traverse_pc_small(root: MessageView<'_>, junk: &mut Junk) -> Result<(), Box<dyn std::error::Error>> {
+fn traverse_pc_small(root: MessageView<'_>, junk: &mut Junk) -> BenchResult<()> {
     junk.u32_sum = junk
         .u32_sum
         .wrapping_add(root.scalar::<i32>(0).unwrap_or_default() as u32);
@@ -755,7 +985,7 @@ fn traverse_pc_small(root: MessageView<'_>, junk: &mut Junk) -> Result<(), Box<d
     Ok(())
 }
 
-fn traverse_pc_alias_array(field: FieldView<'_>, junk: &mut Junk) -> Result<(), Box<dyn std::error::Error>> {
+fn traverse_pc_alias_array(field: FieldView<'_>, junk: &mut Junk) -> BenchResult<()> {
     let array = ArrayView::new(field.object_words().ok_or("alias array missing words")?)
         .ok_or("invalid alias array")?;
     let values = array.scalars::<f32>().ok_or("alias array is not f32")?;
@@ -765,7 +995,7 @@ fn traverse_pc_alias_array(field: FieldView<'_>, junk: &mut Junk) -> Result<(), 
     Ok(())
 }
 
-fn traverse_pc_vec2d(field: FieldView<'_>, junk: &mut Junk) -> Result<(), Box<dyn std::error::Error>> {
+fn traverse_pc_vec2d(field: FieldView<'_>, junk: &mut Junk) -> BenchResult<()> {
     let rows = ArrayView::new(field.object_words().ok_or("matrix missing words")?).ok_or("invalid matrix")?;
     for row in rows.iter() {
         traverse_pc_alias_array(row, junk)?;
@@ -773,7 +1003,7 @@ fn traverse_pc_vec2d(field: FieldView<'_>, junk: &mut Junk) -> Result<(), Box<dy
     Ok(())
 }
 
-fn traverse_pc_arr_map(field: FieldView<'_>, junk: &mut Junk) -> Result<(), Box<dyn std::error::Error>> {
+fn traverse_pc_arr_map(field: FieldView<'_>, junk: &mut Junk) -> BenchResult<()> {
     let map = MapView::new(field.object_words().ok_or("arr map missing words")?)
         .ok_or("invalid arr map")?;
     for pair in map.iter() {
@@ -785,7 +1015,7 @@ fn traverse_pc_arr_map(field: FieldView<'_>, junk: &mut Junk) -> Result<(), Box<
     Ok(())
 }
 
-fn traverse_pc_main(root: MessageView<'_>, junk: &mut Junk) -> Result<(), Box<dyn std::error::Error>> {
+fn traverse_pc_main(root: MessageView<'_>, junk: &mut Junk) -> BenchResult<()> {
     junk.u32_sum = junk.u32_sum.wrapping_add(
         (root.scalar::<i32>(0).unwrap_or_default() as u32)
             .wrapping_add(root.scalar::<u32>(1).unwrap_or_default())
@@ -894,4 +1124,484 @@ fn traverse_pc_main(root: MessageView<'_>, junk: &mut Junk) -> Result<(), Box<dy
         traverse_pc_arr_map(value, junk)?;
     }
     Ok(())
+}
+
+fn build_reflect_descriptor_plan(
+    pool: &PcDescriptorPool,
+    descriptor_name: &str,
+    descriptor: &PcDescriptor,
+) -> BenchResult<ReflectDescriptorPlan> {
+    let mut fields = descriptor.fields.iter().collect::<Vec<_>>();
+    fields.sort_by_key(|(name, field)| reflect_field_order(descriptor_name, name, field.id));
+    let mut planned = Vec::with_capacity(fields.len());
+    for (_, field) in fields {
+        planned.push(build_reflect_field_plan(pool, field)?);
+    }
+    Ok(ReflectDescriptorPlan { fields: planned })
+}
+
+fn build_pb_reflect_descriptor_plan(descriptor: &prost_reflect::MessageDescriptor) -> PbReflectDescriptorPlan {
+    let mut fields = descriptor.fields().collect::<Vec<_>>();
+    fields.sort_by_key(|field| {
+        reflect_field_order(
+            descriptor.full_name(),
+            field.name(),
+            field.number() as usize,
+        )
+    });
+
+    let fields = fields
+        .into_iter()
+        .map(|descriptor| {
+            let value = build_pb_reflect_value_plan(&descriptor);
+            PbReflectFieldPlan { descriptor, value }
+        })
+        .collect();
+    PbReflectDescriptorPlan { fields }
+}
+
+fn build_pb_reflect_value_plan(field: &ReflectFieldDescriptor) -> PbReflectValuePlan {
+    let kind = if field.is_map() {
+        match field.kind() {
+            ReflectKind::Message(entry) => entry
+                .get_field(2)
+                .expect("protobuf reflect map entry must contain value field")
+                .kind(),
+            _ => unreachable!("protobuf reflect map field must use a map-entry message"),
+        }
+    } else {
+        field.kind()
+    };
+
+    match kind {
+        ReflectKind::Message(descriptor) => {
+            PbReflectValuePlan::Message(Box::new(build_pb_reflect_descriptor_plan(&descriptor)))
+        }
+        ReflectKind::Bytes => PbReflectValuePlan::Bytes,
+        ReflectKind::String => PbReflectValuePlan::String,
+        ReflectKind::Double => PbReflectValuePlan::Double,
+        ReflectKind::Float => PbReflectValuePlan::Float,
+        ReflectKind::Uint64
+        | ReflectKind::Fixed64 => PbReflectValuePlan::Uint64,
+        ReflectKind::Uint32
+        | ReflectKind::Fixed32 => PbReflectValuePlan::Uint32,
+        ReflectKind::Int64
+        | ReflectKind::Sint64
+        | ReflectKind::Sfixed64 => PbReflectValuePlan::Int64,
+        ReflectKind::Int32
+        | ReflectKind::Sint32
+        | ReflectKind::Sfixed32 => PbReflectValuePlan::Int32,
+        ReflectKind::Bool => PbReflectValuePlan::Bool,
+        ReflectKind::Enum(_) => PbReflectValuePlan::Enum,
+    }
+}
+
+fn build_reflect_field_plan(
+    pool: &PcDescriptorPool,
+    field: &PcField,
+) -> BenchResult<ReflectFieldPlan> {
+    Ok(ReflectFieldPlan {
+        id: field.id,
+        repeated: field.repeated,
+        key: (field.key != PcFieldType::None).then_some(field.key),
+        value: build_reflect_value_plan(pool, field)?,
+    })
+}
+
+fn build_reflect_value_plan(
+    pool: &PcDescriptorPool,
+    field: &PcField,
+) -> BenchResult<ReflectValuePlan> {
+    Ok(match field.value {
+        PcFieldType::Message => {
+            let descriptor = pool
+                .find(if field.value_type.is_empty() {
+                    return Err("missing reflected message type".into());
+                } else {
+                    &field.value_type
+                })
+                .ok_or("missing reflected message descriptor")?;
+            ReflectValuePlan::Message {
+                alias: if descriptor.is_alias() {
+                    Some(Box::new(build_reflect_field_plan(pool, &descriptor.alias)?))
+                } else {
+                    None
+                },
+                descriptor: if !descriptor.is_alias() {
+                    Some(Box::new(build_reflect_descriptor_plan(pool, &field.value_type, descriptor)?))
+                } else {
+                    None
+                },
+            }
+        }
+        PcFieldType::Bytes => ReflectValuePlan::Bytes,
+        PcFieldType::String => ReflectValuePlan::String,
+        PcFieldType::Double => ReflectValuePlan::Double,
+        PcFieldType::Float => ReflectValuePlan::Float,
+        PcFieldType::Uint64 => ReflectValuePlan::Uint64,
+        PcFieldType::Uint32 => ReflectValuePlan::Uint32,
+        PcFieldType::Int64 => ReflectValuePlan::Int64,
+        PcFieldType::Int32 => ReflectValuePlan::Int32,
+        PcFieldType::Bool => ReflectValuePlan::Bool,
+        PcFieldType::Enum => ReflectValuePlan::Enum,
+        PcFieldType::None | PcFieldType::Unknown => {
+            return Err("invalid reflected field type".into());
+        }
+    })
+}
+
+fn reflect_field_order(descriptor_name: &str, field_name: &str, field_id: usize) -> usize {
+    const SMALL_ORDER: &[&str] = &["str", "flag", "i32"];
+    const MAIN_ORDER: &[&str] = &[
+        "arrays",
+        "t_i64",
+        "vector",
+        "t_i32",
+        "objects",
+        "flags",
+        "f32v",
+        "datav",
+        "strv",
+        "t_u64",
+        "u64v",
+        "matrix",
+        "t_s64",
+        "object",
+        "f32",
+        "objectv",
+        "data",
+        "str",
+        "mode",
+        "f64v",
+        "flag",
+        "f64",
+        "u64",
+        "index",
+        "t_s32",
+        "t_u32",
+        "i32v",
+        "i64",
+        "u32",
+        "i32",
+    ];
+
+    let known = match descriptor_name {
+        "test.Small" => SMALL_ORDER,
+        "test.Main" => MAIN_ORDER,
+        _ => &[],
+    };
+    known
+        .iter()
+        .position(|name| *name == field_name)
+        .unwrap_or(known.len() + field_id)
+}
+
+fn traverse_pc_reflect_descriptor(
+    descriptor: &ReflectDescriptorPlan,
+    root: MessageView<'_>,
+    junk: &mut Junk,
+) -> BenchResult<()> {
+    for field in &descriptor.fields {
+        let Some(value) = root.field(field.id) else {
+            continue;
+        };
+        traverse_pc_reflect_field(field, value, junk)?;
+    }
+    Ok(())
+}
+
+fn traverse_pc_reflect_field(
+    field: &ReflectFieldPlan,
+    value: FieldView<'_>,
+    junk: &mut Junk,
+) -> BenchResult<()> {
+    if let Some(key_type) = field.key {
+        let map = value.map().ok_or("invalid reflected map")?;
+        for pair in map.iter() {
+            traverse_pc_reflect_map_key(key_type, pair.key(), junk);
+            traverse_pc_reflect_value(&field.value, pair.value(), junk)?;
+        }
+        return Ok(());
+    }
+
+    if field.repeated {
+        match &field.value {
+            ReflectValuePlan::Message { alias, descriptor } => {
+                if let Some(alias) = alias {
+                    let array = value.array().ok_or("invalid reflected alias array")?;
+                    for item in array.iter() {
+                        traverse_pc_reflect_field(alias, item, junk)?;
+                    }
+                } else {
+                    let array = value.array().ok_or("invalid reflected message array")?;
+                    for item in ViewArray::<MessageView<'_>>::new(array).iter() {
+                        traverse_pc_reflect_descriptor(
+                            descriptor.as_deref().ok_or("missing reflected descriptor plan")?,
+                            item,
+                            junk,
+                        )?;
+                    }
+                }
+            }
+            ReflectValuePlan::Bytes | ReflectValuePlan::String => {
+                let array = value.array().ok_or("invalid reflected string array")?;
+                for item in array.iter() {
+                    traverse_pc_reflect_value(&field.value, item, junk)?;
+                }
+            }
+            ReflectValuePlan::Double => {
+                let array = value.array().ok_or("invalid reflected double array")?;
+                for item in array.scalars::<f64>().ok_or("invalid reflected double scalars")?.iter() {
+                    junk.add_f64(item);
+                }
+            }
+            ReflectValuePlan::Float => {
+                let array = value.array().ok_or("invalid reflected float array")?;
+                for item in array.scalars::<f32>().ok_or("invalid reflected float scalars")?.iter() {
+                    junk.add_f32(item);
+                }
+            }
+            ReflectValuePlan::Uint64 => {
+                let array = value.array().ok_or("invalid reflected u64 array")?;
+                for item in array.scalars::<u64>().ok_or("invalid reflected u64 scalars")?.iter() {
+                    junk.u64_sum = junk.u64_sum.wrapping_add(item);
+                }
+            }
+            ReflectValuePlan::Uint32 => {
+                let array = value.array().ok_or("invalid reflected u32 array")?;
+                for item in array.scalars::<u32>().ok_or("invalid reflected u32 scalars")?.iter() {
+                    junk.u32_sum = junk.u32_sum.wrapping_add(item);
+                }
+            }
+            ReflectValuePlan::Int64 => {
+                let array = value.array().ok_or("invalid reflected i64 array")?;
+                for item in array.scalars::<i64>().ok_or("invalid reflected i64 scalars")?.iter() {
+                    junk.u64_sum = junk.u64_sum.wrapping_add(item as u64);
+                }
+            }
+            ReflectValuePlan::Int32 | ReflectValuePlan::Enum => {
+                let array = value.array().ok_or("invalid reflected i32 array")?;
+                for item in array.scalars::<i32>().ok_or("invalid reflected i32 scalars")?.iter() {
+                    junk.u32_sum = junk.u32_sum.wrapping_add(item as u32);
+                }
+            }
+            ReflectValuePlan::Bool => {
+                let bools = value.string().ok_or("invalid reflected bool array")?.as_bool_array();
+                for item in bools.iter() {
+                    junk.u32_sum = junk.u32_sum.wrapping_add(u32::from(item));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    traverse_pc_reflect_value(&field.value, value, junk)
+}
+
+fn traverse_pc_reflect_map_key(key_type: PcFieldType, key: FieldView<'_>, junk: &mut Junk) {
+    match key_type {
+        PcFieldType::String => {
+            if let Some(value) = key.string() {
+                junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(value.as_bytes()));
+            }
+        }
+        PcFieldType::Uint64 => {
+            junk.u32_sum = junk
+                .u32_sum
+                .wrapping_add(key.scalar::<u64>().unwrap_or_default() as u32);
+        }
+        PcFieldType::Uint32 => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(key.scalar::<u32>().unwrap_or_default());
+        }
+        PcFieldType::Int64 => {
+            junk.u32_sum = junk
+                .u32_sum
+                .wrapping_add(key.scalar::<i64>().unwrap_or_default() as u32);
+        }
+        PcFieldType::Int32 | PcFieldType::Enum => {
+            junk.u32_sum = junk
+                .u32_sum
+                .wrapping_add(key.scalar::<i32>().unwrap_or_default() as u32);
+        }
+        PcFieldType::Bool => {
+            junk.u32_sum = junk
+                .u32_sum
+                .wrapping_add(u32::from(key.scalar::<bool>().unwrap_or_default()));
+        }
+        PcFieldType::Message
+        | PcFieldType::Bytes
+        | PcFieldType::Double
+        | PcFieldType::Float
+        | PcFieldType::None
+        | PcFieldType::Unknown => {}
+    }
+}
+
+fn traverse_pc_reflect_value(
+    field: &ReflectValuePlan,
+    value: FieldView<'_>,
+    junk: &mut Junk,
+) -> BenchResult<()> {
+    match field {
+        ReflectValuePlan::Message { alias, descriptor } => {
+            if let Some(alias) = alias {
+                traverse_pc_reflect_field(alias, value, junk)?;
+            } else if let Some(message) = value.message() {
+                traverse_pc_reflect_descriptor(
+                    descriptor.as_deref().ok_or("missing reflected descriptor plan")?,
+                    message,
+                    junk,
+                )?;
+            }
+        }
+        ReflectValuePlan::Bytes => {
+            if let Some(bytes) = value.string() {
+                junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(bytes.as_bytes()));
+            }
+        }
+        ReflectValuePlan::String => {
+            if let Some(string) = value.string() {
+                junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(string.as_bytes()));
+            }
+        }
+        ReflectValuePlan::Double => junk.add_f64(value.scalar::<f64>().unwrap_or_default()),
+        ReflectValuePlan::Float => junk.add_f32(value.scalar::<f32>().unwrap_or_default()),
+        ReflectValuePlan::Uint64 => {
+            junk.u64_sum = junk.u64_sum.wrapping_add(value.scalar::<u64>().unwrap_or_default());
+        }
+        ReflectValuePlan::Uint32 => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(value.scalar::<u32>().unwrap_or_default());
+        }
+        ReflectValuePlan::Int64 => {
+            junk.u64_sum = junk
+                .u64_sum
+                .wrapping_add(value.scalar::<i64>().unwrap_or_default() as u64);
+        }
+        ReflectValuePlan::Int32 | ReflectValuePlan::Enum => {
+            junk.u32_sum = junk
+                .u32_sum
+                .wrapping_add(value.scalar::<i32>().unwrap_or_default() as u32);
+        }
+        ReflectValuePlan::Bool => {
+            junk.u32_sum = junk
+                .u32_sum
+                .wrapping_add(u32::from(value.scalar::<bool>().unwrap_or_default()));
+        }
+    }
+    Ok(())
+}
+
+fn traverse_pb_reflect_descriptor(
+    descriptor: &PbReflectDescriptorPlan,
+    root: &DynamicMessage,
+    junk: &mut Junk,
+) -> BenchResult<()> {
+    for field in &descriptor.fields {
+        if !root.has_field(&field.descriptor)
+            && (field.descriptor.supports_presence()
+                || field.descriptor.is_list()
+                || field.descriptor.is_map())
+        {
+            continue;
+        }
+        let value = root.get_field(&field.descriptor);
+        traverse_pb_reflect_field(field, value.as_ref(), junk)?;
+    }
+    Ok(())
+}
+
+fn traverse_pb_reflect_field(
+    field: &PbReflectFieldPlan,
+    value: &ReflectValue,
+    junk: &mut Junk,
+) -> BenchResult<()> {
+    if field.descriptor.is_map() {
+        let ReflectValue::Map(entries) = value else {
+            return Err("invalid protobuf reflected map".into());
+        };
+        for (key, value) in entries {
+            traverse_pb_reflect_map_key(key, junk);
+            traverse_pb_reflect_value(&field.value, value, junk)?;
+        }
+        return Ok(());
+    }
+
+    if field.descriptor.is_list() {
+        let ReflectValue::List(items) = value else {
+            return Err("invalid protobuf reflected list".into());
+        };
+        for item in items {
+            traverse_pb_reflect_value(&field.value, item, junk)?;
+        }
+        return Ok(());
+    }
+
+    traverse_pb_reflect_value(&field.value, value, junk)
+}
+
+fn traverse_pb_reflect_map_key(key: &ReflectMapKey, junk: &mut Junk) {
+    match key {
+        ReflectMapKey::Bool(value) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(u32::from(*value));
+        }
+        ReflectMapKey::I32(value) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(*value as u32);
+        }
+        ReflectMapKey::I64(value) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(*value as u32);
+        }
+        ReflectMapKey::U32(value) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(*value);
+        }
+        ReflectMapKey::U64(value) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(*value as u32);
+        }
+        ReflectMapKey::String(value) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(value.as_bytes()));
+        }
+    }
+}
+
+fn traverse_pb_reflect_value(
+    field: &PbReflectValuePlan,
+    value: &ReflectValue,
+    junk: &mut Junk,
+) -> BenchResult<()> {
+    match (field, value) {
+        (PbReflectValuePlan::Message(descriptor), ReflectValue::Message(message)) => {
+            traverse_pb_reflect_descriptor(descriptor, message, junk)?;
+        }
+        (PbReflectValuePlan::Bytes, ReflectValue::Bytes(bytes)) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(bytes));
+        }
+        (PbReflectValuePlan::String, ReflectValue::String(string)) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(string.as_bytes()));
+        }
+        (PbReflectValuePlan::Double, ReflectValue::F64(value)) => junk.add_f64(*value),
+        (PbReflectValuePlan::Float, ReflectValue::F32(value)) => junk.add_f32(*value),
+        (PbReflectValuePlan::Uint64, ReflectValue::U64(value)) => {
+            junk.u64_sum = junk.u64_sum.wrapping_add(*value);
+        }
+        (PbReflectValuePlan::Uint32, ReflectValue::U32(value)) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(*value);
+        }
+        (PbReflectValuePlan::Int64, ReflectValue::I64(value)) => {
+            junk.u64_sum = junk.u64_sum.wrapping_add(*value as u64);
+        }
+        (PbReflectValuePlan::Int32, ReflectValue::I32(value))
+        | (PbReflectValuePlan::Enum, ReflectValue::EnumNumber(value)) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(*value as u32);
+        }
+        (PbReflectValuePlan::Bool, ReflectValue::Bool(value)) => {
+            junk.u32_sum = junk.u32_sum.wrapping_add(u32::from(*value));
+        }
+        _ => return Err("invalid protobuf reflected value".into()),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod benchmark_tests;
+fn words_as_bytes(words: &[u32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words)) }
 }

@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 
 use prost::Message;
-use protocache_schema::DescriptorPool;
+use protocache_extension::reflection::DescriptorPool;
 use prost_types::compiler::{CodeGeneratorRequest, CodeGeneratorResponse, code_generator_response};
 use prost_types::{
     DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorProto,
@@ -77,7 +77,7 @@ fn validate_request(request: &CodeGeneratorRequest) -> Result<(), String> {
     let mut pool = DescriptorPool::default();
     for file in &request.proto_file {
         pool.register(file)
-            .map_err(|err| format!("schema validation failed for {}: {err:?}", file.name()))?;
+            .map_err(|err| format!("schema validation failed: {err:?}"))?;
     }
     Ok(())
 }
@@ -171,17 +171,17 @@ fn generate_file(file: &FileDescriptorProto, registry: &Registry) -> Result<Stri
         let pad = "    ".repeat(package_depth(file.package()));
         writeln!(
             &mut out,
-            "{pad}use protocache_core::{{ArrayView, BoolArray, FieldDecode, FieldView, GeneratedDescriptor, GeneratedMessage, MapView, MessageView, ScalarArray, StringView, ViewArray, ViewMap}};\n"
+            "{pad}use protocache_core::{{ArrayView, BoolArray, Buffer, FieldDecode, FieldView, GeneratedDescriptor, GeneratedMessage, MapView, MessageView, MutableError, ScalarArray, StringView, Unit, ViewArray, ViewMap, serialize_message_at}};\n"
         )
         .unwrap();
         writeln!(
             &mut out,
-            "{pad}use protocache_mutable::{{GeneratedMutableMessage, ListMut, MapMut, MessageMut, MutableError}};\n"
+            "{pad}use protocache_core::mutable::{{MutableArray, MutableArrayElement, MutableField, MutableMap, MutableMessage}};\n"
         )
         .unwrap();
     } else {
-        out.push_str("use protocache_core::{ArrayView, BoolArray, FieldDecode, FieldView, GeneratedDescriptor, GeneratedMessage, MapView, MessageView, ScalarArray, StringView, ViewArray, ViewMap};\n");
-        out.push_str("use protocache_mutable::{GeneratedMutableMessage, ListMut, MapMut, MessageMut, MutableError};\n\n");
+        out.push_str("use protocache_core::{ArrayView, BoolArray, Buffer, FieldDecode, FieldView, GeneratedDescriptor, GeneratedMessage, MapView, MessageView, MutableError, ScalarArray, StringView, Unit, ViewArray, ViewMap, serialize_message_at};\n");
+        out.push_str("use protocache_core::mutable::{MutableArray, MutableArrayElement, MutableField, MutableMap, MutableMessage};\n\n");
     }
 
     let indent = package_depth(file.package());
@@ -205,6 +205,11 @@ fn generate_file(file: &FileDescriptorProto, registry: &Registry) -> Result<Stri
         }
     }
     Ok(out)
+}
+
+pub fn generate_rust_for_file(file: &FileDescriptorProto) -> Result<String, String> {
+    let registry = build_registry(std::slice::from_ref(file));
+    generate_file(file, &registry)
 }
 
 fn generate_enum(out: &mut String, item: &EnumDescriptorProto, indent: usize) {
@@ -299,19 +304,15 @@ fn generate_alias(
             writeln!(out, "{pad}    }}").unwrap();
         }
         AliasTarget::Array => {
-            writeln!(out, "{pad}    pub fn detect_len(words: &'a [u32]) -> Option<usize> {{").unwrap();
-            writeln!(out, "{pad}        ArrayView::detect_len(words)").unwrap();
-            writeln!(out, "{pad}    }}").unwrap();
+            write_alias_array_detect_len(out, registry, message, indent)?;
             writeln!(out, "{pad}    pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {{").unwrap();
-            writeln!(out, "{pad}        ArrayView::detect(words)").unwrap();
+            writeln!(out, "{pad}        Some(words.get(..Self::detect_len(words)?)?)").unwrap();
             writeln!(out, "{pad}    }}").unwrap();
         }
         AliasTarget::Map => {
-            writeln!(out, "{pad}    pub fn detect_len(words: &'a [u32]) -> Option<usize> {{").unwrap();
-            writeln!(out, "{pad}        MapView::detect_len(words)").unwrap();
-            writeln!(out, "{pad}    }}").unwrap();
+            write_alias_map_detect_len(out, registry, message, indent)?;
             writeln!(out, "{pad}    pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {{").unwrap();
-            writeln!(out, "{pad}        MapView::detect(words)").unwrap();
+            writeln!(out, "{pad}        Some(words.get(..Self::detect_len(words)?)?)").unwrap();
             writeln!(out, "{pad}    }}").unwrap();
         }
     }
@@ -368,6 +369,10 @@ fn generate_alias(
     writeln!(out, "{pad}impl GeneratedDescriptor for {rust_name}<'_> {{").unwrap();
     writeln!(out, "{pad}    const FULL_NAME: &'static str = \"{full}\";").unwrap();
     writeln!(out, "{pad}}}\n").unwrap();
+
+    let mutable_name = format!("{rust_name}Mutable");
+    let mutable_ty = alias_mutable_type(field, registry)?;
+    writeln!(out, "{pad}pub type {mutable_name}<'a> = {mutable_ty};\n").unwrap();
     Ok(())
 }
 
@@ -393,11 +398,9 @@ fn generate_regular_message(
     writeln!(out, "{pad}    pub fn from_words(words: &'a [u32]) -> Option<Self> {{").unwrap();
     writeln!(out, "{pad}        Some(Self {{ view: MessageView::new(words)? }})").unwrap();
     writeln!(out, "{pad}    }}").unwrap();
-    writeln!(out, "{pad}    pub fn detect_len(words: &'a [u32]) -> Option<usize> {{").unwrap();
-    writeln!(out, "{pad}        MessageView::detect_len(words)").unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
+    write_message_detect_len(out, registry, message, indent)?;
     writeln!(out, "{pad}    pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {{").unwrap();
-    writeln!(out, "{pad}        MessageView::detect(words)").unwrap();
+    writeln!(out, "{pad}        Some(words.get(..Self::detect_len(words)?)?)").unwrap();
     writeln!(out, "{pad}    }}").unwrap();
     writeln!(out, "{pad}    pub fn from_view(view: MessageView<'a>) -> Self {{ Self {{ view }} }}").unwrap();
     writeln!(out, "{pad}    pub fn raw(self) -> MessageView<'a> {{ self.view }}").unwrap();
@@ -455,57 +458,7 @@ fn generate_mutable_message(
         .rust_types
         .get(full)
         .ok_or_else(|| format!("missing rust name for {full}"))?;
-    let mut_name = format!("{rust_name}Mut");
-    let mut_ref_name = format!("{rust_name}MutRef");
-
-    writeln!(out, "{pad}pub struct {mut_name}<'a> {{").unwrap();
-    writeln!(out, "{pad}    inner: MessageMut<'a>,").unwrap();
-    writeln!(out, "{pad}}}\n").unwrap();
-    writeln!(out, "{pad}pub struct {mut_ref_name}<'b, 'a> {{").unwrap();
-    writeln!(out, "{pad}    inner: &'b mut MessageMut<'a>,").unwrap();
-    writeln!(out, "{pad}}}\n").unwrap();
-
-    writeln!(out, "{pad}impl<'a> {rust_name}<'a> {{").unwrap();
-    writeln!(
-        out,
-        "{pad}    pub fn open_mut(schema_path: impl AsRef<std::path::Path>, words: &'a [u32]) -> Result<{mut_name}<'a>, MutableError> {{"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "{pad}        Ok({mut_name}::from_inner(<Self as GeneratedMutableMessage>::open_mut(schema_path, words)?))"
-    )
-    .unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
-    writeln!(
-        out,
-        "{pad}    pub fn new_mut(schema_path: impl AsRef<std::path::Path>) -> Result<{mut_name}<'static>, MutableError> {{"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "{pad}        Ok({mut_name}::from_inner(<Self as GeneratedMutableMessage>::new_mut(schema_path)?))"
-    )
-    .unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
-    writeln!(out, "{pad}}}\n").unwrap();
-
-    writeln!(out, "{pad}impl<'a> {mut_name}<'a> {{").unwrap();
-    writeln!(out, "{pad}    pub fn from_inner(inner: MessageMut<'a>) -> Self {{").unwrap();
-    writeln!(out, "{pad}        Self {{ inner }}").unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
-    writeln!(out, "{pad}    pub fn into_inner(self) -> MessageMut<'a> {{").unwrap();
-    writeln!(out, "{pad}        self.inner").unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
-    writeln!(out, "{pad}    pub fn raw_mut(&mut self) -> &mut MessageMut<'a> {{").unwrap();
-    writeln!(out, "{pad}        &mut self.inner").unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
-    writeln!(out, "{pad}    pub fn as_ref_mut(&mut self) -> {mut_ref_name}<'_, 'a> {{").unwrap();
-    writeln!(out, "{pad}        {mut_ref_name}::from_inner(&mut self.inner)").unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
-    writeln!(out, "{pad}    pub fn serialize_words(&self) -> Result<Vec<u32>, MutableError> {{").unwrap();
-    writeln!(out, "{pad}        self.inner.serialize_words()").unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
+    let mutable_name = format!("{rust_name}Mutable");
 
     let mut fields = BTreeMap::new();
     for field in &message.field {
@@ -514,21 +467,129 @@ fn generate_mutable_message(
         }
         fields.insert(field.number(), field);
     }
+    let max_id = fields.keys().last().copied().unwrap_or(0);
+    let accessed_words = (max_id + 63) / 64;
+
+    writeln!(out, "{pad}#[derive(Clone, Debug)]").unwrap();
+    writeln!(out, "{pad}pub struct {mutable_name}<'a> {{").unwrap();
+    writeln!(out, "{pad}    __view__: MutableMessage<'a, {max_id}, {accessed_words}>,").unwrap();
+    for field in fields.values() {
+        writeln!(
+            out,
+            "{pad}    _{}: {},",
+            field.name(),
+            mutable_field_type(field, registry)?
+        )
+        .unwrap();
+    }
+    writeln!(out, "{pad}}}\n").unwrap();
+    writeln!(out, "{pad}impl<'a> Default for {mutable_name}<'a> {{").unwrap();
+    writeln!(out, "{pad}    fn default() -> Self {{").unwrap();
+    writeln!(out, "{pad}        Self {{").unwrap();
+    writeln!(out, "{pad}            __view__: MutableMessage::new(),").unwrap();
+    for field in fields.values() {
+        writeln!(out, "{pad}            _{}: Default::default(),", field.name()).unwrap();
+    }
+    writeln!(out, "{pad}        }}").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
+    writeln!(out, "{pad}}}\n").unwrap();
+
+    writeln!(out, "{pad}impl<'a> {mutable_name}<'a> {{").unwrap();
+    writeln!(out, "{pad}    pub fn new() -> Self {{ Self::default() }}").unwrap();
+    writeln!(out, "{pad}    pub fn from_words(words: &'a [u32]) -> Option<Self> {{").unwrap();
+    writeln!(out, "{pad}        Some(Self {{ __view__: MutableMessage::from_words(words)?, ..Self::default() }})").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
+    writeln!(out, "{pad}    pub fn has_field(&self, id: usize) -> bool {{ self.__view__.has_field(id) }}").unwrap();
+    writeln!(out, "{pad}    pub fn is_effectively_empty(&self) -> bool {{").unwrap();
+    if fields.is_empty() {
+        writeln!(out, "{pad}        true").unwrap();
+    } else {
+        let checks = fields
+            .values()
+            .map(|field| format!("MutableField::is_default_value(&self._{})", field.name()))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        writeln!(out, "{pad}        {checks}").unwrap();
+    }
+    writeln!(out, "{pad}    }}").unwrap();
+    writeln!(out, "{pad}    pub fn encode_to_unit(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {{").unwrap();
+    writeln!(out, "{pad}        if let Some(words) = self.__view__.clean_words() {{").unwrap();
+    writeln!(out, "{pad}            return Ok(protocache_core::mutable::copy_words(words, buffer, false));").unwrap();
+    writeln!(out, "{pad}        }}").unwrap();
+    writeln!(out, "{pad}        let last = buffer.len();").unwrap();
+    writeln!(out, "{pad}        let mut parts = [Unit::empty(); {max_id}];").unwrap();
+    for field in fields.values().rev() {
+        let id = field.number() - 1;
+        writeln!(out, "{pad}        self.__view__.serialize_field({id}usize, &self._{}, buffer, &mut parts[{id}usize])?;", field.name()).unwrap();
+    }
+    writeln!(out, "{pad}        serialize_message_at(&mut parts, buffer, last).ok_or_else(|| MutableError::SerializeFailed {{").unwrap();
+    writeln!(out, "{pad}            descriptor: \"{full}\".to_owned(),").unwrap();
+    writeln!(out, "{pad}            field: \"<message>\".to_owned(),").unwrap();
+    writeln!(out, "{pad}        }})").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
+    writeln!(out, "{pad}    pub fn serialize_words(&self) -> Result<Vec<u32>, MutableError> {{").unwrap();
+    writeln!(out, "{pad}        let mut buffer = Buffer::new();").unwrap();
+    writeln!(out, "{pad}        let _ = self.serialize_into_buffer(&mut buffer)?;").unwrap();
+    writeln!(out, "{pad}        Ok(buffer.view().to_vec())").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
+    writeln!(out, "{pad}    pub fn serialize_into_buffer<'b>(&self, buffer: &'b mut Buffer) -> Result<&'b [u32], MutableError> {{").unwrap();
+    writeln!(out, "{pad}        buffer.clear();").unwrap();
+    writeln!(out, "{pad}        let _ = self.encode_to_unit(buffer)?;").unwrap();
+    writeln!(out, "{pad}        Ok(buffer.view())").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
+
     for field in fields.values() {
         generate_mutable_getter(out, registry, field, indent)?;
     }
     writeln!(out, "{pad}}}\n").unwrap();
 
-    writeln!(out, "{pad}impl<'b, 'a> {mut_ref_name}<'b, 'a> {{").unwrap();
-    writeln!(out, "{pad}    pub fn from_inner(inner: &'b mut MessageMut<'a>) -> Self {{").unwrap();
-    writeln!(out, "{pad}        Self {{ inner }}").unwrap();
+    writeln!(out, "{pad}impl<'a> MutableField<'a> for {mutable_name}<'a> {{").unwrap();
+    writeln!(out, "{pad}    fn decode(field: FieldView<'a>) -> Option<Self> {{").unwrap();
+        writeln!(out, "{pad}        Self::from_words(field.object_words()?)").unwrap();
     writeln!(out, "{pad}    }}").unwrap();
-    writeln!(out, "{pad}    pub fn raw_mut(&mut self) -> &mut MessageMut<'a> {{").unwrap();
-    writeln!(out, "{pad}        self.inner").unwrap();
+    writeln!(out, "{pad}    fn detect<'b>(field: FieldView<'b>) -> Option<&'b [u32]> {{").unwrap();
+    writeln!(out, "{pad}        {rust_name}::detect(field.object_words()?)").unwrap();
     writeln!(out, "{pad}    }}").unwrap();
-    for field in fields.values() {
-        generate_mutable_getter(out, registry, field, indent)?;
+    writeln!(out, "{pad}    fn encode_nested(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {{").unwrap();
+    writeln!(out, "{pad}        self.encode_to_unit(buffer)").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
+    writeln!(out, "{pad}    fn encode_present(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {{").unwrap();
+    writeln!(out, "{pad}        let mut unit = self.encode_to_unit(buffer)?;").unwrap();
+    writeln!(out, "{pad}        if unit.size() > 1 {{ protocache_core::fold_field(buffer, &mut unit); }}").unwrap();
+    writeln!(out, "{pad}        Ok(unit)").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
+    if fields.is_empty() {
+        writeln!(out, "{pad}    fn is_dirty(&self) -> bool {{ false }}").unwrap();
+        writeln!(out, "{pad}    fn has_nested_dirty(&self) -> bool {{ false }}").unwrap();
+    } else {
+        let dirty_checks = fields
+            .values()
+            .map(|field| format!("self.__view__.was_accessed({}usize)", field.number() - 1))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        writeln!(out, "{pad}    fn is_dirty(&self) -> bool {{ {dirty_checks} }}").unwrap();
+        writeln!(out, "{pad}    fn has_nested_dirty(&self) -> bool {{ self.is_dirty() }}").unwrap();
     }
+    writeln!(out, "{pad}    fn is_default_value(&self) -> bool {{ self.is_effectively_empty() }}").unwrap();
+    writeln!(out, "{pad}}}\n").unwrap();
+
+    writeln!(out, "{pad}impl<'a> MutableArrayElement<'a> for {mutable_name}<'a> {{").unwrap();
+    writeln!(out, "{pad}    fn decode_array(words: &'a [u32]) -> Option<Vec<Self>> {{").unwrap();
+    writeln!(out, "{pad}        let array = ArrayView::new(words)?;").unwrap();
+    writeln!(out, "{pad}        let mut values = Vec::with_capacity(array.len());").unwrap();
+    writeln!(out, "{pad}        for item in array.iter() {{ values.push(Self::from_words(item.object_words()?)?); }}").unwrap();
+    writeln!(out, "{pad}        Some(values)").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
+    writeln!(out, "{pad}    fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError> {{").unwrap();
+    writeln!(out, "{pad}        if values.is_empty() {{ return Ok(Unit::inline(&[1])); }}").unwrap();
+    writeln!(out, "{pad}        let last = buffer.len();").unwrap();
+    writeln!(out, "{pad}        let mut units = vec![Unit::empty(); values.len()];").unwrap();
+    writeln!(out, "{pad}        for i in (0..values.len()).rev() {{ units[i] = values[i].encode_nested(buffer)?; }}").unwrap();
+    writeln!(out, "{pad}        protocache_core::serialize_array_at(&units, buffer, last).ok_or_else(|| MutableError::SerializeFailed {{").unwrap();
+    writeln!(out, "{pad}            descriptor: \"{full}\".to_owned(),").unwrap();
+    writeln!(out, "{pad}            field: \"<array>\".to_owned(),").unwrap();
+    writeln!(out, "{pad}        }})").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
     writeln!(out, "{pad}}}\n").unwrap();
     Ok(())
 }
@@ -541,111 +602,297 @@ fn generate_mutable_getter(
 ) -> Result<(), String> {
     let pad = "    ".repeat(indent);
     let name = field.name();
+    writeln!(
+        out,
+        "{pad}    pub fn {name}(&mut self) -> {} {{",
+        mutable_getter_return_type(field, registry)?
+    )
+    .unwrap();
+    if field.label() == Label::Optional && field.r#type() == Type::Message && !is_map_field(field, registry) {
+        writeln!(
+            out,
+            "{pad}        self.__view__.get_field({}usize, &mut self._{}).as_mut()",
+            field.number() - 1,
+            name
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            out,
+            "{pad}        self.__view__.get_field({}usize, &mut self._{})",
+            field.number() - 1,
+            name
+        )
+        .unwrap();
+    }
+    writeln!(out, "{pad}    }}\n").unwrap();
+    Ok(())
+}
 
+fn write_alias_array_detect_len(
+    out: &mut String,
+    registry: &Registry,
+    message: &DescriptorProto,
+    indent: usize,
+) -> Result<(), String> {
+    let pad = "    ".repeat(indent);
+    let field = &message.field[0];
+    writeln!(out, "{pad}    pub fn detect_len(words: &'a [u32]) -> Option<usize> {{").unwrap();
+    match field.r#type() {
+        Type::Int32
+        | Type::Sint32
+        | Type::Sfixed32
+        | Type::Uint32
+        | Type::Fixed32
+        | Type::Int64
+        | Type::Sint64
+        | Type::Sfixed64
+        | Type::Uint64
+        | Type::Fixed64
+        | Type::Float
+        | Type::Double
+        | Type::Enum => {
+            writeln!(out, "{pad}        ArrayView::detect_len(words)").unwrap();
+        }
+        _ => {
+            let detect_expr = singular_detect_expr(field, registry, "item")?;
+            writeln!(
+                out,
+                "{pad}        Some(protocache_core::detect_array_with(words, |item| {detect_expr})?.len())"
+            )
+            .unwrap();
+        }
+    }
+    writeln!(out, "{pad}    }}").unwrap();
+    Ok(())
+}
+
+fn write_alias_map_detect_len(
+    out: &mut String,
+    registry: &Registry,
+    message: &DescriptorProto,
+    indent: usize,
+) -> Result<(), String> {
+    let pad = "    ".repeat(indent);
+    let entry = registry
+        .map_entries
+        .get(message.field[0].type_name())
+        .ok_or_else(|| format!("missing alias map entry for {}", message.field[0].type_name()))?;
+    let key = entry.field.first().ok_or_else(|| format!("missing map key field for {}", message.field[0].type_name()))?;
+    let value = entry.field.get(1).ok_or_else(|| format!("missing map value field for {}", message.field[0].type_name()))?;
+    let key_expr = singular_detect_expr(key, registry, "key")?;
+    let value_expr = singular_detect_expr(value, registry, "value")?;
+    writeln!(out, "{pad}    pub fn detect_len(words: &'a [u32]) -> Option<usize> {{").unwrap();
+    writeln!(
+        out,
+        "{pad}        Some(protocache_core::detect_map_with(words, |key| {key_expr}, |value| {value_expr})?.len())"
+    )
+    .unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
+    Ok(())
+}
+
+fn write_message_detect_len(
+    out: &mut String,
+    registry: &Registry,
+    message: &DescriptorProto,
+    indent: usize,
+) -> Result<(), String> {
+    let pad = "    ".repeat(indent);
+    writeln!(out, "{pad}    pub fn detect_len(words: &'a [u32]) -> Option<usize> {{").unwrap();
+    writeln!(out, "{pad}        let view = MessageView::detect(words)?;").unwrap();
+
+    let mut fields = BTreeMap::new();
+    for field in &message.field {
+        if field.options.as_ref().and_then(|o| o.deprecated).unwrap_or(false) {
+            continue;
+        }
+        fields.insert(field.number(), field);
+    }
+
+    if fields.is_empty() {
+        writeln!(out, "{pad}        Some(view.len())").unwrap();
+    } else {
+        writeln!(out, "{pad}        let core = MessageView::new(words)?;").unwrap();
+        writeln!(out, "{pad}        let mut end = view.len();").unwrap();
+
+        for field in fields.values().rev() {
+            let id = field.number() - 1;
+            let detect_expr = field_detect_expr(field, registry, "field")?;
+            writeln!(out, "{pad}        if let Some(field) = core.field({id}usize) {{").unwrap();
+            writeln!(
+                out,
+                "{pad}            protocache_core::detect_slice_end(words, {detect_expr}?, &mut end)?;"
+            )
+            .unwrap();
+            writeln!(out, "{pad}        }}").unwrap();
+        }
+
+        writeln!(out, "{pad}        Some(end)").unwrap();
+    }
+    writeln!(out, "{pad}    }}").unwrap();
+    Ok(())
+}
+
+fn field_detect_expr(
+    field: &FieldDescriptorProto,
+    registry: &Registry,
+    var: &str,
+) -> Result<String, String> {
     if is_map_field(field, registry) {
-        let method = if registry.aliases.contains_key(field.type_name()) {
-            "field_alias_map_mut"
-        } else {
-            "field_map_mut"
-        };
-        writeln!(out, "{pad}    pub fn {name}_mut(&mut self) -> Result<&mut MapMut<'a>, MutableError> {{").unwrap();
-        writeln!(out, "{pad}        self.inner.{method}(\"{name}\")").unwrap();
-        writeln!(out, "{pad}    }}\n").unwrap();
-        return Ok(());
+        let entry = registry
+            .map_entries
+            .get(field.type_name())
+            .ok_or_else(|| format!("missing map entry for {}", field.type_name()))?;
+        let key = entry
+            .field
+            .first()
+            .ok_or_else(|| format!("missing map key field for {}", field.type_name()))?;
+        let value = entry
+            .field
+            .get(1)
+            .ok_or_else(|| format!("missing map value field for {}", field.type_name()))?;
+        let key_expr = singular_detect_expr(key, registry, "key")?;
+        let value_expr = singular_detect_expr(value, registry, "value")?;
+        return Ok(format!(
+            "protocache_core::detect_map_with({var}.object_words()?, |key| {key_expr}, |value| {value_expr})"
+        ));
     }
 
     if field.label() == Label::Repeated {
-        let method = if registry.aliases.contains_key(field.type_name()) {
-            "field_alias_list_mut"
-        } else {
-            "field_list_mut"
-        };
-        writeln!(out, "{pad}    pub fn {name}_mut(&mut self) -> Result<&mut ListMut<'a>, MutableError> {{").unwrap();
-        writeln!(out, "{pad}        self.inner.{method}(\"{name}\")").unwrap();
-        writeln!(out, "{pad}    }}\n").unwrap();
-        return Ok(());
+        return Ok(match field.r#type() {
+            Type::Bool => format!("{var}.detect_string()"),
+            Type::Int32
+            | Type::Sint32
+            | Type::Sfixed32
+            | Type::Uint32
+            | Type::Fixed32
+            | Type::Int64
+            | Type::Sint64
+            | Type::Sfixed64
+            | Type::Uint64
+            | Type::Fixed64
+            | Type::Float
+            | Type::Double
+            | Type::Enum => format!("{var}.detect_array()"),
+            _ => {
+                let item_expr = singular_detect_expr(field, registry, "item")?;
+                format!("protocache_core::detect_array_with({var}.object_words()?, |item| {item_expr})")
+            }
+        });
     }
 
-    match field.r#type() {
-        Type::Bool => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: bool) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_bool(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
-        Type::Int32 | Type::Sint32 | Type::Sfixed32 => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: i32) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_i32(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
-        Type::Uint32 | Type::Fixed32 => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: u32) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_u32(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
-        Type::Int64 | Type::Sint64 | Type::Sfixed64 => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: i64) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_i64(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
-        Type::Uint64 | Type::Fixed64 => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: u64) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_u64(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
-        Type::Float => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: f32) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_f32(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
-        Type::Double => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: f64) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_f64(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
-        Type::String => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: impl Into<String>) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_string(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
-        Type::Bytes => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: impl Into<Vec<u8>>) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_bytes(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
-        Type::Enum => {
-            writeln!(out, "{pad}    pub fn set_{name}(&mut self, value: i32) -> Result<(), MutableError> {{").unwrap();
-            writeln!(out, "{pad}        self.inner.set_enum_number(\"{name}\", value)").unwrap();
-            writeln!(out, "{pad}    }}\n").unwrap();
-        }
+    singular_detect_expr(field, registry, var)
+}
+
+fn singular_detect_expr(
+    field: &FieldDescriptorProto,
+    registry: &Registry,
+    var: &str,
+) -> Result<String, String> {
+    Ok(match field.r#type() {
+        Type::Bool
+        | Type::Int32
+        | Type::Sint32
+        | Type::Sfixed32
+        | Type::Uint32
+        | Type::Fixed32
+        | Type::Int64
+        | Type::Sint64
+        | Type::Sfixed64
+        | Type::Uint64
+        | Type::Fixed64
+        | Type::Float
+        | Type::Double
+        | Type::Enum => format!("{var}.detect_scalar()"),
+        Type::String | Type::Bytes => format!("{var}.detect_string()"),
         Type::Message => {
-            if registry.aliases.contains_key(field.type_name()) {
-                match registry.aliases.get(field.type_name()).unwrap() {
-                    AliasTarget::Map => {
-                        writeln!(out, "{pad}    pub fn {name}_mut(&mut self) -> Result<&mut MapMut<'a>, MutableError> {{").unwrap();
-                        writeln!(out, "{pad}        self.inner.field_alias_map_mut(\"{name}\")").unwrap();
-                        writeln!(out, "{pad}    }}\n").unwrap();
-                    }
-                    AliasTarget::Array | AliasTarget::BoolArray => {
-                        writeln!(out, "{pad}    pub fn {name}_mut(&mut self) -> Result<&mut ListMut<'a>, MutableError> {{").unwrap();
-                        writeln!(out, "{pad}        self.inner.field_alias_list_mut(\"{name}\")").unwrap();
-                        writeln!(out, "{pad}    }}\n").unwrap();
-                    }
-                }
-            } else {
-                let nested_rust_name = rust_type_name(registry, field.type_name())?;
-                let nested_mut_ref_name = format!("{nested_rust_name}MutRef");
-                writeln!(out, "{pad}    pub fn {name}_mut(&mut self) -> Result<{nested_mut_ref_name}<'_, 'a>, MutableError> {{").unwrap();
-                writeln!(
-                    out,
-                    "{pad}        Ok({nested_mut_ref_name}::from_inner(self.inner.field_message_mut(\"{name}\")?))"
-                )
-                .unwrap();
-                writeln!(out, "{pad}    }}\n").unwrap();
-            }
+            let rust_type = rust_type_name(registry, field.type_name())?;
+            format!("{rust_type}::detect({var}.object_words()?)")
         }
-        _ => {}
+        other => return Err(format!("unsupported detect type: {other:?}")),
+    })
+}
+
+fn mutable_field_type(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
+    if is_map_field(field, registry) {
+        let entry = registry
+            .map_entries
+            .get(field.type_name())
+            .ok_or_else(|| format!("missing map entry for {}", field.type_name()))?;
+        let key = entry
+            .field
+            .first()
+            .ok_or_else(|| format!("missing map key field for {}", field.type_name()))?;
+        let value = entry
+            .field
+            .get(1)
+            .ok_or_else(|| format!("missing map value field for {}", field.type_name()))?;
+        return Ok(format!(
+            "MutableMap<'a, {}, {}>",
+            mutable_key_type(key)?,
+            mutable_value_type(value, registry)?,
+        ));
     }
-    Ok(())
+
+    if field.label() == Label::Repeated {
+        return Ok(format!("MutableArray<'a, {}>", mutable_value_type(field, registry)?));
+    }
+
+    if field.r#type() == Type::Message {
+        return Ok(format!("Box<{}>", mutable_value_type(field, registry)?));
+    }
+
+    mutable_value_type(field, registry)
+}
+
+fn mutable_getter_return_type(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
+    if field.label() == Label::Optional && field.r#type() == Type::Message && !is_map_field(field, registry) {
+        return Ok(format!("&mut {}", mutable_value_type(field, registry)?));
+    }
+    Ok(format!("&mut {}", mutable_field_type(field, registry)?))
+}
+
+fn mutable_key_type(field: &FieldDescriptorProto) -> Result<String, String> {
+    Ok(match field.r#type() {
+        Type::String => "String".to_owned(),
+        Type::Int32 | Type::Sint32 | Type::Sfixed32 => "i32".to_owned(),
+        Type::Uint32 | Type::Fixed32 => "u32".to_owned(),
+        Type::Int64 | Type::Sint64 | Type::Sfixed64 => "i64".to_owned(),
+        Type::Uint64 | Type::Fixed64 => "u64".to_owned(),
+        other => return Err(format!("unsupported mutable map key type: {other:?}")),
+    })
+}
+
+fn mutable_value_type(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
+    Ok(match field.r#type() {
+        Type::Bool => "bool".to_owned(),
+        Type::Int32 | Type::Sint32 | Type::Sfixed32 => "i32".to_owned(),
+        Type::Uint32 | Type::Fixed32 => "u32".to_owned(),
+        Type::Int64 | Type::Sint64 | Type::Sfixed64 => "i64".to_owned(),
+        Type::Uint64 | Type::Fixed64 => "u64".to_owned(),
+        Type::Float => "f32".to_owned(),
+        Type::Double => "f64".to_owned(),
+        Type::String => "String".to_owned(),
+        Type::Bytes => "Vec<u8>".to_owned(),
+        Type::Enum => "i32".to_owned(),
+        Type::Message => format!("{}<'a>", rust_mutable_base_name(registry, field.type_name())?),
+        other => return Err(format!("unsupported mutable value type: {other:?}")),
+    })
+}
+
+fn alias_mutable_type(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
+    if is_map_field(field, registry) {
+        let entry = registry
+            .map_entries
+            .get(field.type_name())
+            .ok_or_else(|| format!("missing alias map entry for {}", field.type_name()))?;
+        let key = entry.field.first().ok_or_else(|| format!("missing map key field for {}", field.type_name()))?;
+        let value = entry.field.get(1).ok_or_else(|| format!("missing map value field for {}", field.type_name()))?;
+        Ok(format!("MutableMap<'a, {}, {}>", mutable_key_type(key)?, mutable_value_type(value, registry)?))
+    } else {
+        Ok(format!("MutableArray<'a, {}>", mutable_value_type(field, registry)?))
+    }
 }
 
 fn generate_getter(
@@ -846,6 +1093,10 @@ fn rust_type_name(registry: &Registry, full_name: &str) -> Result<String, String
         .get(full_name)
         .cloned()
         .ok_or_else(|| format!("unknown type {full_name}"))
+}
+
+fn rust_mutable_base_name(registry: &Registry, full_name: &str) -> Result<String, String> {
+    Ok(format!("{}Mutable", rust_type_name(registry, full_name)?))
 }
 
 fn flatten_name(full_name: &str, package: &str) -> String {
