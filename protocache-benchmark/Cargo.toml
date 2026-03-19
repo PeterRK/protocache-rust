@@ -1,0 +1,15 @@
+[package]
+name = "protocache-benchmark"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flatbuffers = "=2.1.2"
+prost = "0.13.5"
+prost-reflect = "0.15.0"
+protocache-core = { path = "../protocache-core" }
+protocache-mutable = { path = "../protocache-mutable" }
+protocache-schema = { path = "../protocache-schema" }
+
+[build-dependencies]
+prost-build = "0.13.5"

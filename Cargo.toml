@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "protocache-core",
+    "protoc-gen-pcrs",
+    "protocache-schema",
+    "protocache-mutable",
+    "protocache-benchmark",
+]
+resolver = "2"

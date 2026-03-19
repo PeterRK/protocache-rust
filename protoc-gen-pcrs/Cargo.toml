@@ -1,0 +1,13 @@
+[package]
+name = "protoc-gen-pcrs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+prost = "0.13.5"
+prost-types = "0.13.5"
+protocache-core = { path = "../protocache-core" }
+protocache-schema = { path = "../protocache-schema" }
+
+[dev-dependencies]
+protocache-mutable = { path = "../protocache-mutable" }
