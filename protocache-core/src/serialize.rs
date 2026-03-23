@@ -111,15 +111,64 @@ fn copy_inline(body: &mut [u32], body_index: &mut usize, pos: &mut usize, field:
 }
 
 #[inline(always)]
-fn materialize_unit_words(unit: &Unit, buffer: &Buffer) -> Option<Vec<u32>> {
+fn unit_words<'a>(unit: &'a Unit, buffer: &'a Buffer) -> Option<&'a [u32]> {
     if unit.inline_len != 0 {
-        return Some(unit.inline_words().to_vec());
+        return Some(unit.inline_words());
     }
     if unit.segment.len == 0 {
-        return Some(Vec::new());
+        return Some(&[]);
     }
     let start = buffer.len().checked_sub(unit.segment.pos)?;
-    Some(buffer.view().get(start..start + unit.segment.len)?.to_vec())
+    buffer.view().get(start..start + unit.segment.len)
+}
+
+#[inline(always)]
+fn pick_unit(unit: &mut Unit, buffer: &mut Buffer, tail: &mut usize, width: usize) {
+    if unit.inline_len != 0 {
+        return;
+    }
+
+    let seg = unit.segment;
+    if seg.len <= width {
+        let start = buffer.len() - seg.pos;
+        let words = &buffer.head()[start..start + seg.len];
+        unit.inline_len = seg.len;
+        unit.inline_data[..seg.len].copy_from_slice(words);
+        return;
+    }
+
+    let start = buffer.len() - seg.pos;
+    let end = start + seg.len;
+    if *tail > end {
+        let new_start = *tail - seg.len;
+        buffer.head_mut().copy_within(start..end, new_start);
+        unit.segment.pos -= new_start - start;
+        *tail = new_start;
+    } else {
+        debug_assert!(*tail >= seg.len);
+        *tail -= seg.len;
+    }
+}
+
+#[inline(always)]
+fn mark_unit(unit: &Unit, buffer: &mut Buffer, width: usize) {
+    let segment_offset = if unit.inline_len == 0 {
+        Some(offset(buffer.len() - unit.segment.pos))
+    } else {
+        None
+    };
+    let cell = buffer.expand(width);
+    if unit.inline_len != 0 {
+        cell[..unit.inline_len].copy_from_slice(unit.inline_words());
+        for word in &mut cell[unit.inline_len..] {
+            *word = 0;
+        }
+    } else {
+        cell[0] = segment_offset.expect("segment offset must exist for segmented unit");
+        for word in &mut cell[1..] {
+            *word = 0;
+        }
+    }
 }
 
 #[inline(always)]
@@ -548,6 +597,29 @@ pub fn serialize_message(fields: &mut [Unit], buffer: &mut Buffer) -> Option<Uni
 }
 
 #[inline(always)]
+pub fn serialize_array_at_mut(elements: &mut [Unit], buffer: &mut Buffer, last: usize) -> Option<Unit> {
+    if elements.is_empty() {
+        return Some(Unit::inline(&[1]));
+    }
+
+    let (size, width) = best_array_size(elements);
+    if size >= (1usize << 30) {
+        return None;
+    }
+
+    let mut tail = buffer.len().checked_sub(last)?;
+    for unit in elements.iter_mut().rev() {
+        pick_unit(unit, buffer, &mut tail, width);
+    }
+    buffer.shrink(tail);
+    for unit in elements.iter().rev() {
+        mark_unit(unit, buffer, width);
+    }
+    buffer.put(((elements.len() as u32) << 2) | width as u32);
+    Some(Unit::segment(last, buffer.len()))
+}
+
+#[inline(always)]
 pub fn serialize_array_at(elements: &[Unit], buffer: &mut Buffer, last: usize) -> Option<Unit> {
     if elements.is_empty() {
         return Some(Unit::inline(&[1]));
@@ -562,15 +634,15 @@ pub fn serialize_array_at(elements: &[Unit], buffer: &mut Buffer, last: usize) -
     let mut cells = vec![0u32; elements.len() * width];
     let cells_len = cells.len();
     for (index, unit) in elements.iter().enumerate() {
-        let words = materialize_unit_words(unit, buffer)?;
+        let words = unit_words(unit, buffer)?;
         let cell = &mut cells[index * width..(index + 1) * width];
         if words.len() <= width {
-            cell[..words.len()].copy_from_slice(&words);
+            cell[..words.len()].copy_from_slice(words);
         } else {
             let payload_start = cells_len.checked_add(payloads.len())?;
             let cell_start = index.checked_mul(width)?;
             cell[0] = offset(payload_start.checked_sub(cell_start)?);
-            payloads.extend_from_slice(&words);
+            payloads.extend_from_slice(words);
         }
     }
     buffer.shrink(buffer.len().checked_sub(last)?);
@@ -583,6 +655,48 @@ pub fn serialize_array_at(elements: &[Unit], buffer: &mut Buffer, last: usize) -
 #[inline(always)]
 pub fn serialize_array(elements: &[Unit], buffer: &mut Buffer) -> Option<Unit> {
     serialize_array_at(elements, buffer, buffer.len())
+}
+
+#[inline(always)]
+pub fn serialize_map_at_mut(
+    index: &[u8],
+    keys: &mut [Unit],
+    values: &mut [Unit],
+    buffer: &mut Buffer,
+    last: usize,
+) -> Option<Unit> {
+    if keys.len() != values.len() {
+        return None;
+    }
+    if keys.is_empty() {
+        return Some(Unit::inline(&[5u32 << 28]));
+    }
+
+    let (key_size, key_width) = best_array_size(keys);
+    let (value_size, value_width) = best_array_size(values);
+    let index_words = index.len().div_ceil(4);
+    let size = index_words + key_size + value_size;
+    if size >= (1usize << 30) {
+        return None;
+    }
+
+    let mut tail = buffer.len().checked_sub(last)?;
+    for index in (0..keys.len()).rev() {
+        pick_unit(&mut values[index], buffer, &mut tail, value_width);
+        pick_unit(&mut keys[index], buffer, &mut tail, key_width);
+    }
+    buffer.shrink(tail);
+    for index in (0..keys.len()).rev() {
+        mark_unit(&values[index], buffer, value_width);
+        mark_unit(&keys[index], buffer, key_width);
+    }
+
+    let head = buffer.expand(index_words);
+    head.fill(0);
+    let raw = unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
+    raw[..index.len()].copy_from_slice(index);
+    head[0] |= (key_width as u32) << 30 | (value_width as u32) << 28;
+    Some(Unit::segment(last, buffer.len()))
 }
 
 #[inline(always)]
@@ -613,26 +727,26 @@ pub fn serialize_map_at(
     let mut cells = vec![0u32; keys.len() * pair_width];
     let cells_len = cells.len();
     for index in 0..keys.len() {
-        let key_words = materialize_unit_words(&keys[index], buffer)?;
-        let value_words = materialize_unit_words(&values[index], buffer)?;
+        let key_words = unit_words(&keys[index], buffer)?;
+        let value_words = unit_words(&values[index], buffer)?;
         let cell_start = index.checked_mul(pair_width)?;
         let (key_cell, value_cell) = cells[cell_start..cell_start + pair_width].split_at_mut(key_width);
 
         if key_words.len() <= key_width {
-            key_cell[..key_words.len()].copy_from_slice(&key_words);
+            key_cell[..key_words.len()].copy_from_slice(key_words);
         } else {
             let payload_start = cells_len.checked_add(payloads.len())?;
             key_cell[0] = offset(payload_start.checked_sub(cell_start)?);
-            payloads.extend_from_slice(&key_words);
+            payloads.extend_from_slice(key_words);
         }
 
         let value_cell_start = cell_start + key_width;
         if value_words.len() <= value_width {
-            value_cell[..value_words.len()].copy_from_slice(&value_words);
+            value_cell[..value_words.len()].copy_from_slice(value_words);
         } else {
             let payload_start = cells_len.checked_add(payloads.len())?;
             value_cell[0] = offset(payload_start.checked_sub(value_cell_start)?);
-            payloads.extend_from_slice(&value_words);
+            payloads.extend_from_slice(value_words);
         }
     }
     buffer.shrink(buffer.len().checked_sub(last)?);

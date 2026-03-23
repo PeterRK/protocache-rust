@@ -1,20 +1,35 @@
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use prost::Message;
+use prost_types::compiler::{CodeGeneratorRequest, CodeGeneratorResponse};
 use prost_types::FileDescriptorSet;
-use protoc_gen_pcrs::generate_rust_for_file;
+
+#[derive(Debug)]
+struct GeneratedFile {
+    name: String,
+    content: String,
+}
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo_root = manifest_dir.parent().unwrap().to_path_buf();
     let fixture_root = repo_root.join("tests/fixtures");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let checked_in_pcrs_generated_path = manifest_dir.join("src/test.pc.rs");
+    let checked_in_pcrs_extra_generated_path = manifest_dir.join("src/test.pc-ex.rs");
     let flatc = env::var_os("FLATC")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("flatc"));
+    let protoc_gen_pcrs = env::var_os("PROTOC_GEN_PCRS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("protoc-gen-pcrs"));
+    let protoc_gen_pcrs_parameter = env::var("PROTOC_GEN_PCRS_PARAMETER")
+        .unwrap_or_else(|_| "extra".to_owned());
 
     println!(
         "cargo:rerun-if-changed={}",
@@ -24,6 +39,17 @@ fn main() {
         "cargo:rerun-if-changed={}",
         fixture_root.join("benchmark/test.fbs").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        checked_in_pcrs_generated_path.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        checked_in_pcrs_extra_generated_path.display()
+    );
+    println!("cargo:rerun-if-env-changed=PROTOC_GEN_PCRS");
+    println!("cargo:rerun-if-env-changed=PROTOC_GEN_PCRS_PARAMETER");
+    println!("cargo:rerun-if-env-changed=FLATC");
 
     let prost_proto = out_dir.join("test-prost.proto");
     let pcrs_proto = out_dir.join("test-pcrs.proto");
@@ -66,9 +92,21 @@ fn main() {
         .into_iter()
         .find(|file| file.name() == "test-pcrs.proto")
         .unwrap();
-    let pcrs_generated_path = out_dir.join("test_pc.rs");
-    let pcrs_generated = generate_rust_for_file(&pcrs_file).unwrap();
-    fs::write(pcrs_generated_path, pcrs_generated).unwrap();
+    match generate_with_protoc_gen_pcrs(&protoc_gen_pcrs, pcrs_file, normalize_parameter(&protoc_gen_pcrs_parameter)).unwrap() {
+        Some(generated_files) => write_generated_files(
+            &generated_files,
+            &checked_in_pcrs_generated_path,
+            &checked_in_pcrs_extra_generated_path,
+        ),
+        None => {
+            println!(
+                "cargo:warning=skipping pcrs regeneration because {:?} was not found; using checked-in {} and {}",
+                protoc_gen_pcrs,
+                checked_in_pcrs_generated_path.display(),
+                checked_in_pcrs_extra_generated_path.display()
+            );
+        }
+    }
 
     let flatbuffers_schema = out_dir.join("test.fbs");
     let mut flatbuffers_source = fs::read_to_string(fixture_root.join("benchmark/test.fbs")).unwrap();
@@ -93,6 +131,126 @@ fn main() {
     let mut generated = fs::read_to_string(&generated_path).unwrap();
     rewrite_flatbuffers_generated_identifiers(&mut generated);
     fs::write(generated_path, generated).unwrap();
+}
+
+fn generate_with_protoc_gen_pcrs(
+    generator: &PathBuf,
+    file: prost_types::FileDescriptorProto,
+    parameter: Option<String>,
+) -> Result<Option<Vec<GeneratedFile>>, String> {
+    let request = CodeGeneratorRequest {
+        file_to_generate: vec![file.name().to_owned()],
+        parameter,
+        proto_file: vec![file],
+        compiler_version: None,
+    };
+    let mut input = Vec::new();
+    request
+        .encode(&mut input)
+        .map_err(|err| format!("failed to encode CodeGeneratorRequest: {err}"))?;
+
+    let child = Command::new(generator)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                return format!("not found");
+            }
+            format!("failed to launch {:?}: {err}", generator)
+        });
+    let mut child = match child {
+        Ok(child) => child,
+        Err(err) if err == "not found" => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("failed to open stdin for {:?}", generator))?
+        .write_all(&input)
+        .map_err(|err| format!("failed to write request to {:?}: {err}", generator))?;
+
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("failed to open stdout for {:?}", generator))?
+        .read_to_end(&mut output)
+        .map_err(|err| format!("failed to read response from {:?}: {err}", generator))?;
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed to wait for {:?}: {err}", generator))?;
+    if !status.success() {
+        return Err(format!("{:?} exited with status {status}", generator));
+    }
+
+    let response = CodeGeneratorResponse::decode(output.as_slice())
+        .map_err(|err| format!("failed to decode CodeGeneratorResponse: {err}"))?;
+    if let Some(error) = response.error {
+        return Err(format!("protoc-gen-pcrs returned error: {error}"));
+    }
+
+    let generated_files = response
+        .file
+        .into_iter()
+        .map(|file| {
+            let name = file
+                .name
+                .ok_or_else(|| "protoc-gen-pcrs returned a file without name".to_owned())?;
+            let content = file
+                .content
+                .ok_or_else(|| format!("protoc-gen-pcrs returned {name} without content"))?;
+            Ok(GeneratedFile { name, content })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if generated_files.is_empty() {
+        return Err("protoc-gen-pcrs did not return generated content".to_owned());
+    }
+    Ok(Some(generated_files))
+}
+
+fn write_if_changed(path: &PathBuf, contents: &str) {
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == contents => {}
+        _ => fs::write(path, contents).unwrap(),
+    }
+}
+
+fn write_generated_files(
+    generated_files: &[GeneratedFile],
+    readonly_path: &PathBuf,
+    extra_path: &PathBuf,
+) {
+    let mut readonly = None;
+    let mut extra = None;
+    for file in generated_files {
+        if file.name.ends_with(".pc.rs") {
+            readonly = Some(file.content.as_str());
+        } else if file.name.ends_with(".pc-ex.rs") {
+            extra = Some(file.content.as_str());
+        }
+    }
+
+    write_if_changed(
+        readonly_path,
+        readonly.expect("protoc-gen-pcrs did not return a .pc.rs file"),
+    );
+    match extra {
+        Some(extra) => write_if_changed(extra_path, extra),
+        None => write_if_changed(extra_path, ""),
+    }
+}
+
+fn normalize_parameter(parameter: &str) -> Option<String> {
+    let trimmed = parameter.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 fn rewrite_flatbuffers_generated_identifiers(generated: &mut String) {

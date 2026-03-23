@@ -295,13 +295,6 @@ unsafe extern "C" {
 }
 
 #[cfg(test)]
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,8 +302,37 @@ mod tests {
     use std::io::Write as _;
     use tempfile::TempDir;
 
-    fn fixture_schema() -> PathBuf {
-        workspace_root().join("tests/fixtures/proto/test.proto")
+    const TEST_SCHEMA: &str = r#"
+        syntax = "proto3";
+        package test;
+
+        message Child {
+            string name = 1;
+        }
+
+        message AliasVec {
+            repeated Child _ = 1;
+        }
+
+        message AliasMap {
+            map<string, Child> _ = 1;
+        }
+
+        message Main {
+            Child child = 1;
+            AliasVec items = 2;
+            AliasMap lookup = 3;
+        }
+    "#;
+
+    fn test_schema_file() -> (TempDir, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix("pcrs-proto-schema-")
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("test.proto");
+        fs::write(&path, TEST_SCHEMA).unwrap();
+        (dir, path)
     }
 
     fn write_temp_proto_files(files: &[(&str, &str)]) -> TempDir {
@@ -349,8 +371,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_real_fixture_proto_file() {
-        let path = fixture_schema();
+    fn parses_proto_file_from_targeted_schema() {
+        let (_dir, path) = test_schema_file();
         let file = parse_proto_file(&path).unwrap();
 
         assert_eq!(file.package(), "test");
@@ -358,7 +380,7 @@ mod tests {
         assert!(file
             .message_type
             .iter()
-            .find(|message| message.name() == "ArrMap")
+            .find(|message| message.name() == "AliasMap")
             .unwrap()
             .nested_type
             .iter()
@@ -370,27 +392,26 @@ mod tests {
         let err = parse_proto("syntax = \"proto3\"; message {", "broken.proto").unwrap_err();
         assert!(matches!(err, ProtoError::ParseFailed { .. }));
 
-        let err = parse_proto_file(workspace_root().join("tests/fixtures/proto/missing.proto"))
-            .unwrap_err();
+        let (_dir, path) = test_schema_file();
+        let err = parse_proto_file(path.parent().unwrap().join("missing.proto")).unwrap_err();
         assert!(matches!(err, ProtoError::ParseFailed { .. } | ProtoError::Io(_)));
     }
 
     #[test]
-    fn builds_reflection_pool_from_real_fixture_proto() {
-        let pool = load_descriptor_pool_from_proto_file(fixture_schema()).unwrap();
+    fn builds_reflection_pool_from_targeted_schema_file() {
+        let (_dir, path) = test_schema_file();
+        let pool = load_descriptor_pool_from_proto_file(path).unwrap();
 
         let root = pool.find("test.Main").unwrap();
-        assert_eq!(
-            root.fields.get("matrix").unwrap().value_type,
-            "test.Vec2D"
-        );
-        assert!(pool.find("test.Vec2D").unwrap().is_alias());
-        assert!(pool.find("test.ArrMap").unwrap().alias.is_map());
+        assert_eq!(root.fields.get("child").unwrap().value_type, "test.Child");
+        assert!(pool.find("test.AliasVec").unwrap().is_alias());
+        assert!(pool.find("test.AliasMap").unwrap().alias.is_map());
     }
 
     #[test]
-    fn builds_prost_reflect_pool_from_real_fixture_proto() {
-        let pool = load_reflect_descriptor_pool_from_proto_file(fixture_schema()).unwrap();
+    fn builds_prost_reflect_pool_from_targeted_schema_file() {
+        let (_dir, path) = test_schema_file();
+        let pool = load_reflect_descriptor_pool_from_proto_file(path).unwrap();
         let root = pool.get_message_by_name("test.Main").unwrap();
         assert_eq!(root.full_name(), "test.Main");
     }

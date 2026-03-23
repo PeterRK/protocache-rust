@@ -32,9 +32,9 @@ pub mod encoding {
 }
 
 pub use access::{
-    ArrayIter, ArrayView, BoolArray, FieldDecode, FieldView, GeneratedDescriptor,
-    GeneratedMessage, MapIter, MapKey, MapView, MessageView, PairView, ScalarArray, StringView,
-    ViewArray, ViewMap, detect_array_with, detect_map_with, detect_slice_end,
+    ArrayIter, ArrayView, BoolArray, FieldDecode, FieldView, MapIter, MapKey, MapView,
+    MessageView, PairView, ScalarArray, StringView, ViewArray, ViewMap, detect_array_with,
+    detect_map_with, detect_slice_end,
 };
 pub use mutable::{
     MutableArray, MutableArrayElement, MutableField, MutableMap, MutableMapKey, MutableMapKeyKind,
@@ -43,8 +43,9 @@ pub use mutable::{
 pub use perfect_hash::PerfectHashView;
 pub use serialize::{
     Segment, Unit, build_perfect_hash_index, build_perfect_hash_index_with_positions, fold_field,
-    serialize_array, serialize_array_at, serialize_bool, serialize_bytes, serialize_map,
-    serialize_map_at, serialize_message, serialize_message_at, serialize_scalar, serialize_str,
+    serialize_array, serialize_array_at, serialize_array_at_mut, serialize_bool, serialize_bytes,
+    serialize_map, serialize_map_at, serialize_map_at_mut, serialize_message, serialize_message_at,
+    serialize_scalar, serialize_str,
 };
 pub use utils::{
     Buffer, Bytes, CorruptionKind, EnumValue, ReadError, Scalar, Words, compress, compress_into,

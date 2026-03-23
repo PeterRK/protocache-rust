@@ -7,8 +7,8 @@ use std::marker::PhantomData;
 
 use crate::{
     ArrayView, Buffer, FieldView, MapKey, MapView, MessageView, Scalar, StringView, Unit,
-    build_perfect_hash_index_with_positions, fold_field, serialize_array_at, serialize_bool,
-    serialize_bytes, serialize_map_at, serialize_scalar, serialize_str, detect_slice_end,
+    build_perfect_hash_index_with_positions, fold_field, serialize_array_at_mut, serialize_bool,
+    serialize_bytes, serialize_map_at_mut, serialize_scalar, serialize_str, detect_slice_end,
 };
 
 #[derive(Debug)]
@@ -66,17 +66,28 @@ pub enum MutableMapKeyKind {
 pub trait MutableField<'a>: Clone + Default {
     fn decode(field: FieldView<'a>) -> Option<Self>;
     fn detect(field: FieldView<'a>) -> Option<&'a [u32]>;
-    fn is_dirty(&self) -> bool {
+    fn folds_when_present() -> bool
+    where
+        Self: Sized,
+    {
         true
     }
-    fn has_nested_dirty(&self) -> bool {
+    fn is_empty_field(&self) -> bool {
         false
     }
-    fn encode_nested(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        self.encode_present(buffer)
+    fn omits_default_after_encode() -> bool
+    where
+        Self: Sized,
+    {
+        true
     }
-    fn encode_present(&self, buffer: &mut Buffer) -> Result<Unit, MutableError>;
-    fn is_default_value(&self) -> bool;
+    fn is_dirty(&self) -> bool {
+        false
+    }
+    fn has_nested_dirty(&self) -> bool {
+        self.is_dirty()
+    }
+    fn encode(&self, buffer: &mut Buffer) -> Result<Unit, MutableError>;
 }
 
 pub trait MutableArrayElement<'a>: MutableField<'a> {
@@ -93,12 +104,27 @@ pub trait MutableArrayElement<'a>: MutableField<'a> {
 pub trait MutableMapKey<'a>: Clone + Eq + Hash {
     fn decode_key(field: FieldView<'a>) -> Option<Self>;
     fn detect_key(field: FieldView<'a>) -> Option<&'a [u32]>;
-    fn encode_nested_key(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        self.encode_key(buffer)
-    }
     fn encode_key(&self, buffer: &mut Buffer) -> Result<Unit, MutableError>;
     fn key_kind() -> MutableMapKeyKind;
-    fn as_key_bytes(&self) -> Vec<u8>;
+    fn borrowed_key_bytes(&self) -> Option<&[u8]> {
+        None
+    }
+    fn write_key_bytes<'b>(&'b self, scratch: &'b mut [u8; 8]) -> &'b [u8];
+}
+
+#[derive(Clone, Copy)]
+enum KeyBytes<'a> {
+    Borrowed(&'a [u8]),
+    Inline { data: [u8; 8], len: usize },
+}
+
+impl AsRef<[u8]> for KeyBytes<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Inline { data, len } => &data[..*len],
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -384,8 +410,31 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
 
     pub fn encode_to_unit(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
         let last = buffer.len();
-        let items = self.entries.iter().collect::<Vec<_>>();
-        let key_bytes = items.iter().map(|(k, _)| k.as_key_bytes()).collect::<Vec<_>>();
+        let mut memo = Vec::with_capacity(self.entries.len());
+        let mut key_bytes = Vec::with_capacity(self.entries.len());
+        match K::key_kind() {
+            MutableMapKeyKind::String => {
+                for pair in self.entries.iter() {
+                    key_bytes.push(KeyBytes::Borrowed(
+                        pair.0
+                            .borrowed_key_bytes()
+                            .expect("string keys should expose borrowed bytes"),
+                    ));
+                    memo.push(pair);
+                }
+            }
+            _ => {
+                for pair in self.entries.iter() {
+                    let mut scratch = [0u8; 8];
+                    let len = {
+                        let bytes = pair.0.write_key_bytes(&mut scratch);
+                        bytes.len()
+                    };
+                    key_bytes.push(KeyBytes::Inline { data: scratch, len });
+                    memo.push(pair);
+                }
+            }
+        }
         let (index, positions) = build_perfect_hash_index_with_positions(&key_bytes).ok_or(
             MutableError::SerializeFailed {
                 descriptor: "<map>".to_owned(),
@@ -393,20 +442,20 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
             },
         )?;
 
-        let mut ordered = vec![None; items.len()];
+        let mut book = vec![0usize; memo.len()];
         for (idx, position) in positions.into_iter().enumerate() {
-            ordered[position] = Some(items[idx]);
+            book[position] = idx;
         }
 
-        let mut keys = vec![Unit::empty(); ordered.len()];
-        let mut values = vec![Unit::empty(); ordered.len()];
-        for i in (0..ordered.len()).rev() {
-            let (key, value) = ordered[i].expect("perfect-hash positions must cover all entries");
-            values[i] = value.encode_nested(buffer)?;
-            keys[i] = key.encode_nested_key(buffer)?;
+        let mut keys = vec![Unit::empty(); book.len()];
+        let mut values = vec![Unit::empty(); book.len()];
+        for i in (0..book.len()).rev() {
+            let (key, value) = memo[book[i]];
+            values[i] = value.encode(buffer)?;
+            keys[i] = key.encode_key(buffer)?;
         }
 
-        serialize_map_at(&index, &keys, &values, buffer, last).ok_or_else(|| MutableError::SerializeFailed {
+        serialize_map_at_mut(&index, &mut keys, &mut values, buffer, last).ok_or_else(|| MutableError::SerializeFailed {
             descriptor: "<map>".to_owned(),
             field: "<encode>".to_owned(),
         })
@@ -478,8 +527,12 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
         (self.accessed[word] & (1u64 << bit)) != 0
     }
 
+    pub fn has_any_accessed(&self) -> bool {
+        self.accessed.iter().any(|&word| word != 0)
+    }
+
     pub fn clean_words(&self) -> Option<&[u32]> {
-        if self.accessed.iter().any(|&word| word != 0) {
+        if self.has_any_accessed() {
             None
         } else {
             self.words.as_deref()
@@ -515,14 +568,35 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
             return Ok(());
         }
 
-        if field.is_default_value() {
+        if field.is_empty_field() {
             *unit = Unit::empty();
             return Ok(());
         }
 
-        *unit = field.encode_present(buffer)?;
+        *unit = field.encode(buffer)?;
+        if T::omits_default_after_encode() && should_omit_message_unit(unit) {
+            drop_present_unit(buffer, unit);
+        } else if T::folds_when_present() {
+            fold_field(buffer, unit);
+        } else {
+            debug_assert!(!T::omits_default_after_encode());
+            debug_assert!(!unit.is_segment());
+        }
         Ok(())
     }
+}
+
+fn should_omit_message_unit(unit: &Unit) -> bool {
+    unit.size() == 1
+}
+
+fn drop_present_unit(buffer: &mut Buffer, unit: &mut Unit) {
+    if unit.is_segment() {
+        let seg = unit.segment_info();
+        debug_assert_eq!(seg.pos, buffer.len());
+        buffer.shrink(seg.len);
+    }
+    *unit = Unit::empty();
 }
 
 pub fn copy_words(words: &[u32], buffer: &mut Buffer, fold: bool) -> Unit {
@@ -545,12 +619,26 @@ macro_rules! impl_scalar_field {
                 field.detect_scalar()
             }
 
-            fn encode_present(&self, _buffer: &mut Buffer) -> Result<Unit, MutableError> {
-                Ok(serialize_scalar::<$ty>(*self))
+            fn folds_when_present() -> bool
+            where
+                Self: Sized,
+            {
+                false
             }
 
-            fn is_default_value(&self) -> bool {
-                *self == <$ty>::default()
+            fn is_empty_field(&self) -> bool {
+                *self == 0 as $ty
+            }
+
+            fn omits_default_after_encode() -> bool
+            where
+                Self: Sized,
+            {
+                false
+            }
+
+            fn encode(&self, _buffer: &mut Buffer) -> Result<Unit, MutableError> {
+                Ok(serialize_scalar::<$ty>(*self))
             }
         }
 
@@ -601,8 +689,11 @@ macro_rules! impl_scalar_map_key {
                 MutableMapKeyKind::$map_kind
             }
 
-            fn as_key_bytes(&self) -> Vec<u8> {
-                MapKey::as_key_bytes(self)
+            fn write_key_bytes<'b>(&'b self, scratch: &'b mut [u8; 8]) -> &'b [u8] {
+                let bytes = MapKey::as_key_bytes(self);
+                let len = bytes.len();
+                scratch[..len].copy_from_slice(&bytes);
+                &scratch[..len]
             }
         }
     };
@@ -617,12 +708,26 @@ impl<'a> MutableField<'a> for bool {
         field.detect_scalar()
     }
 
-    fn encode_present(&self, _buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        Ok(serialize_bool(*self))
+    fn folds_when_present() -> bool
+    where
+        Self: Sized,
+    {
+        false
     }
 
-    fn is_default_value(&self) -> bool {
+    fn is_empty_field(&self) -> bool {
         !*self
+    }
+
+    fn omits_default_after_encode() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    fn encode(&self, _buffer: &mut Buffer) -> Result<Unit, MutableError> {
+        Ok(serialize_bool(*self))
     }
 }
 
@@ -668,24 +773,22 @@ impl<'a> MutableField<'a> for String {
         field.detect_string()
     }
 
-    fn encode_present(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        let mut unit = serialize_str(self, buffer).ok_or_else(|| MutableError::SerializeFailed {
-            descriptor: "<string>".to_owned(),
-            field: "<encode>".to_owned(),
-        })?;
-        fold_field(buffer, &mut unit);
-        Ok(unit)
+    fn is_empty_field(&self) -> bool {
+        self.is_empty()
     }
 
-    fn encode_nested(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
+    fn omits_default_after_encode() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    fn encode(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
         serialize_str(self, buffer).ok_or_else(|| MutableError::SerializeFailed {
             descriptor: "<string>".to_owned(),
             field: "<encode>".to_owned(),
         })
-    }
-
-    fn is_default_value(&self) -> bool {
-        self.is_empty()
     }
 }
 
@@ -714,15 +817,6 @@ impl<'a> MutableMapKey<'a> for String {
     }
 
     fn encode_key(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        let mut unit = serialize_str(self, buffer).ok_or_else(|| MutableError::SerializeFailed {
-            descriptor: "<map>".to_owned(),
-            field: "<string-key>".to_owned(),
-        })?;
-        fold_field(buffer, &mut unit);
-        Ok(unit)
-    }
-
-    fn encode_nested_key(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
         serialize_str(self, buffer).ok_or_else(|| MutableError::SerializeFailed {
             descriptor: "<map>".to_owned(),
             field: "<string-key>".to_owned(),
@@ -733,8 +827,12 @@ impl<'a> MutableMapKey<'a> for String {
         MutableMapKeyKind::String
     }
 
-    fn as_key_bytes(&self) -> Vec<u8> {
-        self.as_bytes().to_vec()
+    fn borrowed_key_bytes(&self) -> Option<&[u8]> {
+        Some(self.as_bytes())
+    }
+
+    fn write_key_bytes<'b>(&'b self, _scratch: &'b mut [u8; 8]) -> &'b [u8] {
+        self.as_bytes()
     }
 }
 
@@ -747,24 +845,22 @@ impl<'a> MutableField<'a> for Vec<u8> {
         field.detect_string()
     }
 
-    fn encode_present(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        let mut unit = serialize_bytes(self, buffer).ok_or_else(|| MutableError::SerializeFailed {
-            descriptor: "<bytes>".to_owned(),
-            field: "<encode>".to_owned(),
-        })?;
-        fold_field(buffer, &mut unit);
-        Ok(unit)
+    fn is_empty_field(&self) -> bool {
+        self.is_empty()
     }
 
-    fn encode_nested(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
+    fn omits_default_after_encode() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    fn encode(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
         serialize_bytes(self, buffer).ok_or_else(|| MutableError::SerializeFailed {
             descriptor: "<bytes>".to_owned(),
             field: "<encode>".to_owned(),
         })
-    }
-
-    fn is_default_value(&self) -> bool {
-        self.is_empty()
     }
 }
 
@@ -792,14 +888,19 @@ impl<'a, T: MutableArrayElement<'a>> MutableField<'a> for MutableArray<'a, T> {
         Self::detect_array_field(field)
     }
 
-    fn encode_present(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        let mut unit = self.encode_to_unit(buffer)?;
-        fold_field(buffer, &mut unit);
-        Ok(unit)
+    fn encode(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
+        self.encode_to_unit(buffer)
     }
 
-    fn encode_nested(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        self.encode_to_unit(buffer)
+    fn is_empty_field(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn omits_default_after_encode() -> bool
+    where
+        Self: Sized,
+    {
+        false
     }
 
     fn is_dirty(&self) -> bool {
@@ -808,10 +909,6 @@ impl<'a, T: MutableArrayElement<'a>> MutableField<'a> for MutableArray<'a, T> {
 
     fn has_nested_dirty(&self) -> bool {
         self.is_dirty()
-    }
-
-    fn is_default_value(&self) -> bool {
-        self.is_empty()
     }
 }
 
@@ -824,14 +921,19 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableField<'a> for Mutable
         detect_map_words::<K, V>(field.object_words()?)
     }
 
-    fn encode_present(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        let mut unit = self.encode_to_unit(buffer)?;
-        fold_field(buffer, &mut unit);
-        Ok(unit)
+    fn encode(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
+        self.encode_to_unit(buffer)
     }
 
-    fn encode_nested(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        self.encode_to_unit(buffer)
+    fn is_empty_field(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn omits_default_after_encode() -> bool
+    where
+        Self: Sized,
+    {
+        false
     }
 
     fn is_dirty(&self) -> bool {
@@ -840,10 +942,6 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableField<'a> for Mutable
 
     fn has_nested_dirty(&self) -> bool {
         self.is_dirty()
-    }
-
-    fn is_default_value(&self) -> bool {
-        self.is_empty()
     }
 }
 
@@ -893,12 +991,8 @@ impl<'a, T: MutableField<'a>> MutableField<'a> for Box<T> {
         T::detect(field)
     }
 
-    fn encode_present(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        self.as_ref().encode_present(buffer)
-    }
-
-    fn encode_nested(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        self.as_ref().encode_nested(buffer)
+    fn encode(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
+        self.as_ref().encode(buffer)
     }
 
     fn is_dirty(&self) -> bool {
@@ -907,10 +1001,6 @@ impl<'a, T: MutableField<'a>> MutableField<'a> for Box<T> {
 
     fn has_nested_dirty(&self) -> bool {
         self.as_ref().has_nested_dirty()
-    }
-
-    fn is_default_value(&self) -> bool {
-        self.as_ref().is_default_value()
     }
 }
 
@@ -921,14 +1011,9 @@ fn encode_object_array<'a, T: MutableField<'a>>(values: &[T], buffer: &mut Buffe
     let last = buffer.len();
     let mut units = vec![Unit::empty(); values.len()];
     for i in (0..values.len()).rev() {
-        let unit = values[i].encode_nested(buffer)?;
-        units[i] = if !unit.is_segment() && unit.size() > 2 {
-            copy_words(unit.inline_words(), buffer, false)
-        } else {
-            unit
-        };
+        units[i] = values[i].encode(buffer)?;
     }
-    serialize_array_at(&units, buffer, last).ok_or_else(|| MutableError::SerializeFailed {
+    serialize_array_at_mut(&mut units, buffer, last).ok_or_else(|| MutableError::SerializeFailed {
         descriptor: "<array>".to_owned(),
         field: "<encode>".to_owned(),
     })
@@ -936,60 +1021,9 @@ fn encode_object_array<'a, T: MutableField<'a>>(values: &[T], buffer: &mut Buffe
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::Path;
-
-    use super::{MutableArray, MutableMap};
-    use crate::{Buffer, MutableField, MapView, MessageView, Unit};
-
-    fn repo_root() -> &'static Path {
-        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
-    }
-
-    fn load_fixture_words() -> Vec<u32> {
-        let raw = fs::read(repo_root().join("tests/fixtures/benchmark/test.pc")).unwrap();
-        raw.chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect()
-    }
-
-    fn materialize(unit: Unit, buffer: &mut Buffer) -> Vec<u32> {
-        if unit.is_segment() {
-            buffer.view().to_vec()
-        } else {
-            unit.inline_words().to_vec()
-        }
-    }
-
-    #[test]
-    fn map_ex_keeps_existing_and_inserted_alias_entries_after_reserialize() {
-        let words = load_fixture_words();
-        let root = MessageView::new(&words).unwrap();
-        let field_words = root.field(29).unwrap().object_words().unwrap();
-        let mut map = MutableMap::<String, MutableArray<f32>>::from_words(field_words).unwrap();
-
-        map.get_mut(&"lv5".to_owned()).unwrap().push(53.0);
-        let mut inserted = MutableArray::new();
-        inserted.push(91.0);
-        inserted.push(92.0);
-        assert!(map.insert("lv9".to_owned(), inserted).is_none());
-
-        let mut buffer = Buffer::new();
-        let unit = map.encode_to_unit(&mut buffer).unwrap();
-        let encoded = materialize(unit, &mut buffer);
-        let view = MapView::new(&encoded).unwrap();
-
-        let lv5 = view.find_str("lv5").unwrap().value().array().unwrap();
-        assert_eq!(
-            lv5.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
-            vec![51.0, 52.0, 53.0]
-        );
-        let lv9 = view.find_str("lv9").unwrap().value().array().unwrap();
-        assert_eq!(
-            lv9.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
-            vec![91.0, 92.0]
-        );
-    }
+    use super::{MutableArray, MutableMap, drop_present_unit, should_omit_message_unit};
+    use crate::mutable::MutableField;
+    use crate::{Buffer, Unit};
 
     #[test]
     fn array_ex_iter_mut_marks_collection_dirty() {
@@ -1037,5 +1071,26 @@ mod tests {
         assert_eq!(map.get("beta"), Some(&2));
         assert_eq!(map.remove("alpha"), Some(1));
         assert!(!map.contains_key("alpha"));
+    }
+
+    #[test]
+    fn default_present_units_are_omitted_by_shape() {
+        assert!(should_omit_message_unit(&Unit::inline(&[0])));
+        assert!(should_omit_message_unit(&Unit::inline(&[1])));
+        assert!(!should_omit_message_unit(&Unit::inline(&[0, 0])));
+        assert!(!should_omit_message_unit(&Unit::inline(&[2, 0])));
+    }
+
+    #[test]
+    fn dropping_segment_present_unit_rewinds_buffer() {
+        let mut buffer = Buffer::new();
+        buffer.put(0);
+        let mut unit = Unit::segment(0, buffer.len());
+
+        assert!(should_omit_message_unit(&unit));
+        drop_present_unit(&mut buffer, &mut unit);
+
+        assert!(buffer.is_empty());
+        assert!(unit.is_empty());
     }
 }

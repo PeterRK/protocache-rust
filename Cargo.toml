@@ -3,6 +3,6 @@ members = [
     "protocache-core",
     "protocache-extension",
     "protoc-gen-pcrs",
-    "protocache-benchmark",
+    "protocache-test",
 ]
 resolver = "2"

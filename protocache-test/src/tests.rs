@@ -2,6 +2,7 @@ use super::*;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use protocache_core::ViewMap;
 use prost_reflect::{DescriptorPool as ReflectDescriptorPool, DynamicMessage, MapKey as ReflectMapKey, Value as ReflectValue};
 use protocache_extension::reflection::{DescriptorPool as PcDescriptorPool, FieldType, RegisterError};
 use protocache_extension::utils::{
@@ -41,7 +42,7 @@ fn load_reflect_descriptor_pool_from_proto_file(
 }
 
 fn serialize_partly(words: &[u32]) -> Vec<u32> {
-    let mut root = pcrs_generated::test::MainMutable::from_words(words).unwrap();
+    let mut root = pcrs_generated::MainMutable::FromWords(words).unwrap();
     let _ = root.i32();
     let _ = root.u32();
     let _ = root.i64();
@@ -52,15 +53,15 @@ fn serialize_partly(words: &[u32]) -> Vec<u32> {
     let _ = root.data();
     let _ = root.f32();
     let _ = root.f64();
-    root.serialize_words().unwrap()
+    root.SerializeWords().unwrap()
 }
 
 fn serialize_fully_materialized(words: &[u32]) -> Vec<u32> {
-    let mut root = pcrs_generated::test::MainMutable::from_words(words).unwrap();
+    let mut root = pcrs_generated::MainMutable::FromWords(words).unwrap();
     let mut junk = Junk::default();
     traverse_pc_mutable_main(&mut root, &mut junk);
     assert_ne!(junk.fuse(), 0);
-    root.serialize_words().unwrap()
+    root.SerializeWords().unwrap()
 }
 
 fn present_fields(words: &[u32]) -> Vec<usize> {
@@ -92,8 +93,47 @@ fn field_width(view: MessageView<'_>, id: usize) -> usize {
 #[test]
 fn generated_fully_serialization_matches_fixture() {
     let words = load_fixture_words();
-    let root = pcrs_generated::test::MainMutable::from_words(&words).unwrap();
-    assert_eq!(root.serialize_words().unwrap(), words);
+    let root = pcrs_generated::MainMutable::FromWords(&words).unwrap();
+    assert_eq!(root.SerializeWords().unwrap(), words);
+}
+
+#[test]
+fn benchmark_raw_views_decode_fixture_maps_and_arrays() {
+    let words = load_fixture_words();
+    let root = MessageView::new(&words).unwrap();
+
+    let strv = ViewArray::<StringView<'_>>::new(root.array(13).unwrap());
+    assert_eq!(strv.len(), 10);
+    assert_eq!(strv.get(0).unwrap().as_str(), Some("abc"));
+    assert_eq!(strv.get(1).unwrap().as_str(), Some("apple"));
+
+    let index = ViewMap::<StringView<'_>, i32>::new(root.map(25).unwrap());
+    assert_eq!(index.len(), 6);
+    let (key, value) = index.find_str("abc-1").unwrap();
+    assert_eq!(key.as_str(), Some("abc-1"));
+    assert_eq!(value, 1);
+
+    let objects = ViewMap::<i32, MessageView<'_>>::new(root.map(26).unwrap());
+    let (object_key, object_value) = objects.find_scalar(1).unwrap();
+    assert_eq!(object_key, 1);
+    assert_eq!(object_value.scalar::<i32>(0), Some(1));
+    assert!(objects.find_scalar(5).is_none());
+}
+
+#[test]
+fn benchmark_detect_and_corruption_guards_match_fixture_shape() {
+    let mut words = load_fixture_words();
+    let root = MessageView::new(&words).unwrap();
+
+    let strv = root.field(13).unwrap().detect_array().unwrap();
+    assert_eq!(ArrayView::detect(strv).unwrap(), strv);
+    assert_eq!(ArrayView::detect_len(strv).unwrap(), strv.len());
+
+    let index = root.field(25).unwrap().detect_map().unwrap();
+    assert_eq!(MapView::detect(index).unwrap(), index);
+
+    words[0] = u32::MAX;
+    assert!(MessageView::new(&words).is_none());
 }
 
 #[test]
@@ -139,7 +179,6 @@ fn generated_fully_materialized_serialization_matches_fixture() {
     assert_eq!(actual.fuse(), expected.fuse());
 }
 
-
 #[test]
 fn benchmark_fixtures_match_expected_access_hashes() {
     let protobuf_raw = load_fixture_bytes("test.pb");
@@ -175,7 +214,7 @@ fn benchmark_fixtures_match_expected_access_hashes() {
     let descriptor = pool.find(descriptor_name).unwrap();
     let plan = build_reflect_descriptor_plan(&pool, descriptor_name, descriptor).unwrap();
     let mut reflect_junk = Junk::default();
-    traverse_pc_reflect_descriptor(&plan, pc, &mut reflect_junk).unwrap();
+    traverse_pc_reflect_descriptor(&plan, pc, &mut reflect_junk);
     assert_ne!(reflect_junk.fuse(), 0);
 }
 
@@ -190,7 +229,7 @@ fn benchmark_reflect_hash_matches_cpp_baseline() {
     let descriptor = pool.find(descriptor_name).unwrap();
     let plan = build_reflect_descriptor_plan(&pool, descriptor_name, descriptor).unwrap();
     let mut reflect_junk = Junk::default();
-    traverse_pc_reflect_descriptor(&plan, pc, &mut reflect_junk).unwrap();
+    traverse_pc_reflect_descriptor(&plan, pc, &mut reflect_junk);
     assert_eq!(reflect_junk.fuse(), BENCHMARK_REFLECT_FUSE);
 }
 
@@ -198,7 +237,7 @@ fn benchmark_reflect_hash_matches_cpp_baseline() {
 #[test]
 fn benchmark_generated_view_matches_cpp_basic_expectations() {
     let words = load_fixture_words();
-    let root = pcrs_generated::test::Main::from_words(&words).unwrap();
+    let root = pcrs_generated::test::Main::FromWords(&words).unwrap();
 
     assert_eq!(root.i32(), -999);
     assert_eq!(root.u32(), 1234);
@@ -210,10 +249,10 @@ fn benchmark_generated_view_matches_cpp_basic_expectations() {
     assert_eq!(root.data().as_deref(), Some(b"abc123!?$*&()'-=@~".as_slice()));
     assert_eq!(root.object().unwrap().i32(), 88);
     assert_eq!(root.objectv().unwrap().len(), 3);
-    assert_eq!(root.matrix().unwrap().values().unwrap().get(2).unwrap().values().unwrap().get(2), Some(9.0));
+    assert_eq!(root.matrix().unwrap().values().get(2).unwrap().values().get(2), Some(9.0));
 
-    let arrays = root.arrays().unwrap().entries().unwrap();
-    let lv5 = arrays.find_str("lv5").unwrap().1.values().unwrap();
+    let arrays = root.arrays().unwrap().entries();
+    let lv5 = arrays.find_str("lv5").unwrap().1.values();
     assert_eq!(lv5.get(0), Some(51.0));
     assert_eq!(lv5.get(1), Some(52.0));
 }
@@ -221,7 +260,7 @@ fn benchmark_generated_view_matches_cpp_basic_expectations() {
 #[test]
 fn benchmark_generated_ex_matches_cpp_basic_expectations() {
     let words = load_fixture_words();
-    let mut root = pcrs_generated::test::MainMutable::from_words(&words).unwrap();
+    let mut root = pcrs_generated::MainMutable::FromWords(&words).unwrap();
 
     assert_eq!(*root.i32(), -999);
     assert_eq!(*root.u32(), 1234);
@@ -243,7 +282,7 @@ fn benchmark_generated_ex_matches_cpp_basic_expectations() {
 #[test]
 fn benchmark_generated_ex_serialize_mutation_regression() {
     let words = load_fixture_words();
-    let mut root = pcrs_generated::test::MainMutable::from_words(&words).unwrap();
+    let mut root = pcrs_generated::MainMutable::FromWords(&words).unwrap();
 
     root.objectv();
     root.strv()[0] = "xyz".to_owned();
@@ -251,7 +290,7 @@ fn benchmark_generated_ex_serialize_mutation_regression() {
 
     let arrays = root.arrays();
     arrays.get_mut("lv5").unwrap().push(53.0);
-    let mut inserted = pcrs_generated::test::ArrMapArrayMutable::new();
+    let mut inserted = pcrs_generated::ArrayMutable::new();
     inserted.push(91.0);
     inserted.push(92.0);
     assert!(arrays.insert("lv9".to_owned(), inserted).is_none());
@@ -261,19 +300,19 @@ fn benchmark_generated_ex_serialize_mutation_regression() {
         root.objects().get_mut(&key).unwrap().i32().clone_from(&(key + 1));
     }
 
-    let encoded = root.serialize_words().unwrap();
-    let view = pcrs_generated::test::Main::from_words(&encoded).unwrap();
+    let encoded = root.SerializeWords().unwrap();
+    let view = pcrs_generated::test::Main::FromWords(&encoded).unwrap();
 
     assert_eq!(
         view.strv().unwrap().get(0).and_then(|value| value.as_str()),
         Some("xyz")
     );
     assert_eq!(
-        view.matrix().unwrap().values().unwrap().get(1).unwrap().values().unwrap().get(1),
+        view.matrix().unwrap().values().get(1).unwrap().values().get(1),
         Some(999.0)
     );
 
-    let arrays = view.arrays().unwrap().entries().unwrap();
+    let arrays = view.arrays().unwrap().entries();
     let available = arrays
         .iter()
         .filter_map(|(key, _)| key.as_str().map(str::to_owned))
@@ -282,11 +321,10 @@ fn benchmark_generated_ex_serialize_mutation_regression() {
         .find_str("lv5")
         .unwrap_or_else(|| panic!("missing lv5, available keys: {available:?}"))
         .1
-        .values()
-        .unwrap();
+        .values();
     assert_eq!(lv5.len(), 3);
     assert_eq!(lv5.get(2), Some(53.0));
-    let lv9 = arrays.find_str("lv9").unwrap().1.values().unwrap();
+    let lv9 = arrays.find_str("lv9").unwrap().1.values();
     assert_eq!(lv9.get(0), Some(91.0));
     assert_eq!(lv9.get(1), Some(92.0));
 
@@ -326,16 +364,16 @@ fn benchmark_generated_alias_matches_cpp_shape() {
 
 #[test]
 fn benchmark_generated_ex_alias_matches_cpp_shape() {
-    let mut root = pcrs_generated::test::MainMutable::new();
+    let mut root = pcrs_generated::MainMutable::New();
     *root.object().i32() = 0;
-    root.matrix().push(pcrs_generated::test::Vec2DVec1DMutable::new());
-    root.matrix().push(pcrs_generated::test::Vec2DVec1DMutable::new());
-    let mut row = pcrs_generated::test::Vec2DVec1DMutable::new();
+    root.matrix().push(pcrs_generated::Vec1DMutable::new());
+    root.matrix().push(pcrs_generated::Vec1DMutable::new());
+    let mut row = pcrs_generated::Vec1DMutable::new();
     row.push(1.0);
     row.push(1.0);
     row.push(1.0);
     root.matrix().push(row);
-    let words = root.serialize_words().unwrap();
+    let words = root.SerializeWords().unwrap();
     assert_eq!(words.len(), 12);
     assert_eq!(words[4], 0x0d);
     assert_eq!(words[5], 1);
@@ -344,26 +382,26 @@ fn benchmark_generated_ex_alias_matches_cpp_shape() {
 
 #[test]
 fn benchmark_generated_ex_tiny_matches_cpp() {
-    let root = pcrs_generated::test::MainMutable::new();
-    assert_eq!(root.serialize_words().unwrap().len(), 1);
+    let root = pcrs_generated::MainMutable::New();
+    assert_eq!(root.SerializeWords().unwrap().len(), 1);
 }
 
 #[test]
 fn benchmark_generated_string_key_map_stress_matches_cpp() {
-    let mut root = pcrs_generated::test::MainMutable::new();
+    let mut root = pcrs_generated::MainMutable::New();
     for i in 0..64 {
         let key = format!("very_long_key_prefix_to_disable_sso_{i:03}");
-        let mut value = pcrs_generated::test::ArrMapArrayMutable::new();
+        let mut value = pcrs_generated::ArrayMutable::new();
         value.push(i as f32);
         value.push(i as f32 + 0.5);
         assert!(root.arrays().insert(key, value).is_none());
     }
-    let words = root.serialize_words().unwrap();
-    let view = pcrs_generated::test::Main::from_words(&words).unwrap();
-    let arrays = view.arrays().unwrap().entries().unwrap();
+    let words = root.SerializeWords().unwrap();
+    let view = pcrs_generated::test::Main::FromWords(&words).unwrap();
+    let arrays = view.arrays().unwrap().entries();
     for i in 0..64 {
         let key = format!("very_long_key_prefix_to_disable_sso_{i:03}");
-        let values = arrays.find_str(&key).unwrap().1.values().unwrap();
+        let values = arrays.find_str(&key).unwrap().1.values();
         assert_eq!(values.len(), 2);
         assert_eq!(values.get(0), Some(i as f32));
         assert_eq!(values.get(1), Some(i as f32 + 0.5));

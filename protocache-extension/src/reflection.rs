@@ -478,29 +478,67 @@ fn collect_enum_values(item: &EnumDescriptorProto) -> BTreeMap<String, i32> {
 mod tests {
     use super::*;
 
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use prost_types::{
         EnumValueDescriptorProto, FieldOptions, FileDescriptorSet, MessageOptions,
         field_descriptor_proto::Label,
     };
+    use tempfile::TempDir;
+
+    const TEST_SCHEMA: &str = r#"
+        syntax = "proto3";
+        package test;
+
+        enum Mode {
+            MODE_A = 0;
+            MODE_B = 1;
+            MODE_C = 2;
+        }
+
+        message Small {
+            string str = 4;
+            int32 i32 = 1;
+            bool flag = 2;
+        }
+
+        message Vec2D {
+            message Vec1D {
+                repeated float _ = 1;
+            }
+            repeated Vec1D _ = 1;
+        }
+
+        message ArrMap {
+            message Array {
+                repeated float _ = 1;
+            }
+            map<string, Array> _ = 1;
+        }
+
+        message Main {
+            int32 i32 = 1;
+            string str = 2;
+            Small object = 3;
+            repeated int32 i32v = 4;
+            map<string, int32> index = 5;
+            Vec2D matrix = 6;
+            ArrMap arrays = 7;
+        }
+    "#;
 
     #[test]
-    fn registers_fixture_like_schema_and_resolves_aliases() {
+    fn registers_targeted_schema_and_resolves_aliases() {
         let mut pool = DescriptorPool::default();
         pool.register(&fixture_file()).unwrap();
 
         let root = pool.find("test.Main").unwrap();
         assert_eq!(root.tags.get("test_b").map(String::as_str), Some("123"));
 
-        let f64_field = root.fields.get("f64").unwrap();
-        assert_eq!(f64_field.id, 9);
-        assert!(!f64_field.repeated);
-        assert_eq!(f64_field.value, FieldType::Double);
-        assert_eq!(f64_field.tags.get("mark").map(String::as_str), Some("xyz"));
-
-        let strv = root.fields.get("strv").unwrap();
-        assert!(strv.repeated);
-        assert_eq!(strv.value, FieldType::String);
+        let score = root.fields.get("score").unwrap();
+        assert_eq!(score.id, 1);
+        assert!(!score.repeated);
+        assert_eq!(score.value, FieldType::Double);
+        assert_eq!(score.tags.get("mark").map(String::as_str), Some("xyz"));
 
         let mode = root.fields.get("mode").unwrap();
         assert_eq!(mode.value, FieldType::Enum);
@@ -582,11 +620,9 @@ mod tests {
     }
 
     #[test]
-    fn registers_descriptor_emitted_by_protoc_for_real_fixture() {
-        let descriptor_set = compile_descriptor_set(
-            workspace_root().join("tests/fixtures/proto"),
-            "test.proto",
-        );
+    fn registers_descriptor_emitted_by_protoc_for_targeted_schema() {
+        let (_dir, path) = write_test_proto();
+        let descriptor_set = compile_descriptor_set(path.parent().unwrap().to_path_buf(), "test.proto");
         let file = descriptor_set
             .file
             .into_iter()
@@ -744,40 +780,16 @@ mod tests {
         DescriptorProto {
             name: Some("Main".to_owned()),
             field: vec![
-                scalar_field("i32", 1, Type::Int32),
-                scalar_field("u32", 2, Type::Uint32),
-                scalar_field("i64", 3, Type::Int64),
-                scalar_field("u64", 4, Type::Uint64),
-                scalar_field("flag", 5, Type::Bool),
-                named_field("mode", 6, Label::Optional, Type::Enum, Some("Mode"), false, &[]),
-                scalar_field("str", 7, Type::String),
-                scalar_field("data", 8, Type::Bytes),
-                scalar_field("f32", 9, Type::Float),
-                named_field("f64", 10, Label::Optional, Type::Double, None, false, &[tag("mark", "xyz")]),
-                named_field("object", 11, Label::Optional, Type::Message, Some("Small"), false, &[]),
-                repeated_scalar_field("i32v", 12, Type::Int32),
-                repeated_scalar_field("u64v", 13, Type::Uint64),
-                repeated_scalar_field("strv", 14, Type::String),
-                repeated_scalar_field("datav", 15, Type::Bytes),
-                repeated_scalar_field("f32v", 16, Type::Float),
-                repeated_scalar_field("f64v", 17, Type::Double),
-                repeated_scalar_field("flags", 18, Type::Bool),
-                named_field("objectv", 19, Label::Repeated, Type::Message, Some("Small"), false, &[]),
-                scalar_field("t_u32", 20, Type::Fixed32),
-                scalar_field("t_i32", 21, Type::Sfixed32),
-                scalar_field("t_s32", 22, Type::Sint32),
-                scalar_field("t_u64", 23, Type::Fixed64),
-                scalar_field("t_i64", 24, Type::Sfixed64),
-                scalar_field("t_s64", 25, Type::Sint64),
-                named_field("index", 26, Label::Repeated, Type::Message, Some("Main.IndexEntry"), false, &[]),
-                named_field("objects", 27, Label::Repeated, Type::Message, Some("Main.ObjectsEntry"), false, &[]),
-                named_field("matrix", 28, Label::Optional, Type::Message, Some("Vec2D"), false, &[]),
-                named_field("vector", 29, Label::Repeated, Type::Message, Some("ArrMap"), false, &[]),
-                named_field("arrays", 30, Label::Optional, Type::Message, Some("ArrMap"), false, &[]),
+                scalar_field("id", 1, Type::Int32),
+                named_field("score", 2, Label::Optional, Type::Double, None, false, &[tag("mark", "xyz")]),
+                named_field("mode", 3, Label::Optional, Type::Enum, Some("Mode"), false, &[]),
+                named_field("object", 4, Label::Optional, Type::Message, Some("Small"), false, &[]),
+                named_field("index", 5, Label::Repeated, Type::Message, Some("Main.IndexEntry"), false, &[]),
+                named_field("matrix", 6, Label::Optional, Type::Message, Some("Vec2D"), false, &[]),
+                named_field("arrays", 7, Label::Optional, Type::Message, Some("ArrMap"), false, &[]),
             ],
             nested_type: vec![
                 map_entry("IndexEntry", Type::String, None, Type::Int32, None),
-                map_entry("ObjectsEntry", Type::Int32, None, Type::Message, Some("Small")),
             ],
             options: Some(MessageOptions {
                 uninterpreted_option: vec![tag("test_a", "123"), tag("test_b", "123")],
@@ -904,10 +916,6 @@ mod tests {
         named_field(name, number, Label::Optional, ty, None, false, &[])
     }
 
-    fn repeated_scalar_field(name: &str, number: i32, ty: Type) -> FieldDescriptorProto {
-        named_field(name, number, Label::Repeated, ty, None, false, &[])
-    }
-
     fn named_field(
         name: &str,
         number: i32,
@@ -951,11 +959,14 @@ mod tests {
         crate::proto::parse_proto_file_set(proto_dir.join(file_name)).unwrap()
     }
 
-    fn workspace_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .to_path_buf()
+    fn write_test_proto() -> (TempDir, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix("pcrs-reflect-schema-")
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("test.proto");
+        std::fs::write(&path, TEST_SCHEMA).unwrap();
+        (dir, path)
     }
 }
 

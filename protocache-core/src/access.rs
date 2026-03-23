@@ -170,6 +170,11 @@ impl<'a> FieldView<'a> {
     }
 
     #[inline(always)]
+    pub fn expect_raw_words(self) -> &'a [u32] {
+        &self.tail[..self.width]
+    }
+
+    #[inline(always)]
     pub fn object_words(self) -> Option<&'a [u32]> {
         let first = *self.tail.first()?;
         if (first & 3) == 3 {
@@ -180,8 +185,23 @@ impl<'a> FieldView<'a> {
     }
 
     #[inline(always)]
+    pub fn expect_object_words(self) -> &'a [u32] {
+        let first = self.tail[0];
+        if (first & 3) == 3 {
+            &self.tail[(first >> 2) as usize..]
+        } else {
+            self.tail
+        }
+    }
+
+    #[inline(always)]
     pub fn scalar<T: Scalar>(self) -> Option<T> {
         T::from_words(self.raw_words()?)
+    }
+
+    #[inline(always)]
+    pub fn expect_scalar<T: Scalar>(self) -> T {
+        T::from_words(self.expect_raw_words()).expect("invalid scalar field")
     }
 
     #[inline(always)]
@@ -195,6 +215,11 @@ impl<'a> FieldView<'a> {
     }
 
     #[inline(always)]
+    pub fn expect_string(self) -> StringView<'a> {
+        StringView::new(self.expect_object_words()).expect("invalid string field")
+    }
+
+    #[inline(always)]
     pub fn detect_string(self) -> Option<&'a [u32]> {
         StringView::detect(self.object_words()?)
     }
@@ -202,6 +227,11 @@ impl<'a> FieldView<'a> {
     #[inline(always)]
     pub fn message(self) -> Option<MessageView<'a>> {
         MessageView::new(self.object_words()?)
+    }
+
+    #[inline(always)]
+    pub fn expect_message(self) -> MessageView<'a> {
+        MessageView::new(self.expect_object_words()).expect("invalid message field")
     }
 
     #[inline(always)]
@@ -215,6 +245,11 @@ impl<'a> FieldView<'a> {
     }
 
     #[inline(always)]
+    pub fn expect_array(self) -> ArrayView<'a> {
+        ArrayView::new(self.expect_object_words()).expect("invalid array field")
+    }
+
+    #[inline(always)]
     pub fn detect_array(self) -> Option<&'a [u32]> {
         ArrayView::detect(self.object_words()?)
     }
@@ -222,6 +257,11 @@ impl<'a> FieldView<'a> {
     #[inline(always)]
     pub fn map(self) -> Option<MapView<'a>> {
         MapView::new(self.object_words()?)
+    }
+
+    #[inline(always)]
+    pub fn expect_map(self) -> MapView<'a> {
+        MapView::new(self.expect_object_words()).expect("invalid map field")
     }
 
     #[inline(always)]
@@ -307,6 +347,11 @@ impl<'a> MessageView<'a> {
             },
             id,
         )
+    }
+
+    #[inline(always)]
+    pub fn expect_field(self, id: usize) -> FieldView<'a> {
+        self.field(id).expect("missing message field")
     }
 
     #[inline(always)]
@@ -398,6 +443,7 @@ impl<'a> MessageView<'a> {
             width,
         })
     }
+
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -465,6 +511,15 @@ impl<'a> ArrayView<'a> {
     }
 
     #[inline(always)]
+    pub fn expect_field(self, index: usize) -> FieldView<'a> {
+        let start = index * self.width;
+        FieldView {
+            tail: &self.body[start..],
+            width: self.width,
+        }
+    }
+
+    #[inline(always)]
     pub fn scalars<T: Scalar>(self) -> Option<ScalarArray<'a, T>> {
         if self.width != T::WIDTH {
             return None;
@@ -474,6 +529,16 @@ impl<'a> ArrayView<'a> {
             len: self.len,
             _marker: PhantomData,
         })
+    }
+
+    #[inline(always)]
+    pub fn expect_scalars<T: Scalar>(self) -> ScalarArray<'a, T> {
+        assert_eq!(self.width, T::WIDTH);
+        ScalarArray {
+            words: &self.body[..self.len * self.width],
+            len: self.len,
+            _marker: PhantomData,
+        }
     }
 
     #[inline(always)]
@@ -752,6 +817,7 @@ impl<'a> MapView<'a> {
         })
     }
 
+
     #[inline(always)]
     pub fn iter(self) -> MapIter<'a> {
         MapIter {
@@ -954,14 +1020,6 @@ impl<'a, K: FieldDecode<'a>, V: FieldDecode<'a>> IntoIterator for ViewMap<'a, K,
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
-}
-
-pub trait GeneratedMessage<'a>: Sized {
-    fn from_message_view(view: MessageView<'a>) -> Self;
-}
-
-pub trait GeneratedDescriptor {
-    const FULL_NAME: &'static str;
 }
 
 impl<'a> FieldDecode<'a> for StringView<'a> {

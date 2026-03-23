@@ -2,6 +2,38 @@
 
 Rust implementation of ProtoCache.
 
+> Warning
+>
+> This repository's Rust code is fully AI-generated.
+> The implementation, tests, generated APIs, and supporting glue in this workspace were produced by AI.
+> Verify behavior with tests before relying on it in production.
+
+## Benchmark
+
+Using the local Rust harness in `protocache-test` on the bundled benchmark fixture:
+
+|  | Protobuf | ProtoCache | FlatBuffers |
+|:-------|----:|----:|----:|
+| Data Size | **574B** | 780B | 1296B |
+| Decode + Traverse + Dealloc | 3071ns | **304ns** | 374ns |
+| Decode + Traverse(reflection) + Dealloc | 15129ns | **610ns** | - |
+| Compressed Size | 566B | 571B | 856B |
+| Compress | 531ns | 1054ns | 2022ns |
+| Decompress | 363ns | 967ns | 1898ns |
+
+Mutable/serialize paths from the same Rust benchmark:
+
+| | Protobuf | ProtoCacheEX | ProtoCache |
+|:-------|----:|----:|----:|
+| Serialize | **1134ns** | 859 ~ 6478ns | 16216ns |
+| Decode + Traverse + Dealloc | 3071ns | 2680ns | **304ns** |
+
+Run it with:
+
+```bash
+cargo run -p protocache-test --release
+```
+
 ## Provenance
 
 This repository's Rust code is fully AI-generated.
@@ -9,7 +41,7 @@ This repository's Rust code is fully AI-generated.
 - The implementation, tests, and supporting glue in this workspace were produced by AI.
 - Treat the codebase as generated software: verify behavior with tests before relying on it in production.
 
-The Rust workspace keeps the same data format and overall capability split as the original ProtoCache design. It follows the same high-level boundary as the upstream API split:
+The Rust workspace uses the ProtoCache data format and keeps a clear API split between runtime, extension, and code generation layers:
 
 - zero-copy read-only runtime
 - extension APIs for schema reflection, `.proto` loading and protobuf/prost bridging
@@ -24,11 +56,11 @@ The Rust workspace keeps the same data format and overall capability split as th
 | `protocache-core` | Protobuf-free core runtime for reading, writing, hashing, compression and mutable primitives |
 | `protocache-extension` | Extension APIs for `.proto` parsing, descriptor loading, reflection, protobuf/prost bridging and schema-aware mutable APIs |
 | `protoc-gen-pcrs` | Rust code generator for typed APIs |
-| `protocache-benchmark` | Local performance harness |
+| `protocache-test` | Local performance harness and test umbrella |
 
-## Independence from C++
+## Dependency Boundary
 
-The Rust implementation does not depend on any C++ source tree at build or runtime.
+The Rust implementation does not depend on any non-Rust source tree at build or runtime.
 
 - Rust crates only depend on other Rust crates in this workspace and published Rust dependencies.
 - Tests and local performance tooling may reuse fixture data, but that is data reuse, not code dependency.
@@ -89,7 +121,7 @@ Prefer these APIs for long-term integration:
 
 ## Notes
 
-The Rust side follows the same two-layer split as the upstream design:
+The Rust side follows the same two-layer split across this workspace:
 
 - depend on `protocache-core` for the protobuf-free runtime and mutable primitives
 - add `protocache-extension` when you need `extension/*` capabilities such as `.proto` parsing, descriptor handling, reflection, or protobuf/prost bridging

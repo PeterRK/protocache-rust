@@ -12,7 +12,7 @@ use prost_reflect::{
     Kind as ReflectKind, MapKey as ReflectMapKey, Value as ReflectValue, prost_types::FileDescriptorSet,
 };
 use protocache_core::{
-    ArrayView, FieldView, MapView, MessageView, MutableError, PerfectHashView, ReadError,
+    ArrayView, FieldView, MapView, MessageView, MutableError, ReadError,
     StringView, ViewArray, compress_into, decompress_into,
 };
 use protocache_extension::{
@@ -47,7 +47,8 @@ mod fb_generated {
     warnings
 )]
 mod pcrs_generated {
-    include!(concat!(env!("OUT_DIR"), "/test_pc.rs"));
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test.pc.rs"));
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test.pc-ex.rs"));
 }
 
 const DEFAULT_LOOPS: usize = 1_000_000;
@@ -155,7 +156,6 @@ impl Junk {
 
 struct BenchConfig {
     loops: usize,
-    extra: bool,
 }
 
 #[derive(Clone)]
@@ -218,7 +218,6 @@ enum PbReflectValuePlan {
 impl BenchConfig {
     fn from_args() -> Result<Self, String> {
         let mut loops = DEFAULT_LOOPS;
-        let mut extra = false;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -228,17 +227,14 @@ impl BenchConfig {
                         .parse()
                         .map_err(|_| format!("invalid --loops value: {value}"))?;
                 }
-                "--extra" => {
-                    extra = true;
-                }
                 "--help" | "-h" => {
-                    println!("Usage: cargo run -p protocache-benchmark --release -- [--loops N] [--extra]");
+                    println!("Usage: cargo run -p protocache-test --release -- [--loops N]");
                     std::process::exit(0);
                 }
                 _ => return Err(format!("unknown argument: {arg}")),
             }
         }
-        Ok(Self { loops, extra })
+        Ok(Self { loops })
     }
 }
 
@@ -258,11 +254,7 @@ fn main() -> BenchResult<()> {
     benchmark_protocache(&protocache_words, &protocache_raw, config.loops)?;
     benchmark_protobuf_reflect(&schema_path, &protobuf_raw, config.loops)?;
     benchmark_protocache_reflect(&schema_path, &protocache_words, config.loops)?;
-    if config.extra {
-        benchmark_mutable_map_string_lookup(&protocache_words, config.loops)?;
-        benchmark_mutable_message_from_words_copy(&protocache_words, config.loops)?;
-        benchmark_perfect_hash_locate(&protocache_words, config.loops)?;
-    }
+    benchmark_protocache_ex(&protocache_words, &protocache_raw, config.loops)?;
 
     println!("========serialize========");
     benchmark_protobuf_serialize(&protobuf_raw, config.loops)?;
@@ -406,9 +398,25 @@ fn benchmark_protocache_reflect(
     let start = Instant::now();
     for _ in 0..loops {
         let root = MessageView::new(words).ok_or("invalid protocache fixture")?;
-        traverse_pc_reflect_descriptor(&plan, root, &mut junk)?;
+        traverse_pc_reflect_descriptor(&plan, root, &mut junk);
     }
     print_reflect_result("protocache-reflect", start.elapsed(), junk.fuse());
+    Ok(())
+}
+
+fn benchmark_protocache_ex(
+    words: &[u32],
+    raw: &[u8],
+    loops: usize,
+) -> BenchResult<()> {
+    let mut junk = Junk::default();
+    let start = Instant::now();
+    for _ in 0..loops {
+        let mut root =
+            pcrs_generated::MainMutable::FromWords(words).ok_or("invalid protocache fixture")?;
+        traverse_pc_mutable_main(&mut root, &mut junk);
+    }
+    print_access_result("protocache-ex", raw.len(), start.elapsed(), loops, junk.fuse());
     Ok(())
 }
 
@@ -430,63 +438,6 @@ fn benchmark_protobuf_reflect(
         traverse_pb_reflect_descriptor(&plan, &root, &mut junk)?;
     }
     print_reflect_result("protobuf-reflect", start.elapsed(), junk.fuse());
-    Ok(())
-}
-
-fn benchmark_mutable_map_string_lookup(
-    words: &[u32],
-    loops: usize,
-) -> BenchResult<()> {
-    let mut root =
-        pcrs_generated::test::MainMutable::from_words(words).ok_or("invalid protocache fixture")?;
-    let arrays = root.arrays();
-
-    let mut owned_junk = 0u64;
-    let start = Instant::now();
-    for _ in 0..loops {
-        let key = "lv5".to_owned();
-        let values = arrays.get(&key).ok_or("missing lv5 array")?;
-        owned_junk = owned_junk.wrapping_add(values.len() as u64);
-    }
-    print_reflect_result("mapex-string-get-owned", start.elapsed(), owned_junk);
-
-    let mut borrowed_junk = 0u64;
-    let start = Instant::now();
-    for _ in 0..loops {
-        let values = arrays.get("lv5").ok_or("missing lv5 array")?;
-        borrowed_junk = borrowed_junk.wrapping_add(values.len() as u64);
-    }
-    print_reflect_result("mapex-string-get-borrowed", start.elapsed(), borrowed_junk);
-    Ok(())
-}
-
-fn benchmark_mutable_message_from_words_copy(words: &[u32], loops: usize) -> BenchResult<()> {
-    let mut junk = 0u64;
-    let start = Instant::now();
-    for _ in 0..loops {
-        let root =
-            pcrs_generated::test::MainMutable::from_words(words).ok_or("invalid protocache fixture")?;
-        junk = junk.wrapping_add(root.has_field(0) as u64);
-    }
-    print_reflect_result("mutable-message-from-words-copy", start.elapsed(), junk);
-    Ok(())
-}
-
-fn benchmark_perfect_hash_locate(words: &[u32], loops: usize) -> BenchResult<()> {
-    let root = MessageView::new(words).ok_or("invalid protocache fixture")?;
-    let map_words = root
-        .field(25)
-        .and_then(FieldView::object_words)
-        .ok_or("missing index map words")?;
-    let index = PerfectHashView::new(words_as_bytes(map_words))?;
-
-    let mut junk = 0u64;
-    let start = Instant::now();
-    for _ in 0..loops {
-        junk = junk.wrapping_add(index.locate(b"abc-1").ok_or("missing abc-1")? as u64);
-        junk = junk.wrapping_add(index.locate(b"abc-2").ok_or("missing abc-2")? as u64);
-    }
-    print_reflect_result("perfect-hash-locate", start.elapsed(), junk);
     Ok(())
 }
 
@@ -528,7 +479,7 @@ fn benchmark_protocache_generated_serialize(
     loops: usize,
 ) -> BenchResult<()> {
     let mut root =
-        pcrs_generated::test::MainMutable::from_words(words).ok_or("invalid protocache fixture")?;
+        pcrs_generated::MainMutable::FromWords(words).ok_or("invalid protocache fixture")?;
 
     if partly {
         let _ = root.i32();
@@ -550,7 +501,7 @@ fn benchmark_protocache_generated_serialize(
     let mut buffer = protocache_core::Buffer::new();
     let start = Instant::now();
     for _ in 0..loops {
-        let encoded = root.serialize_into_buffer(&mut buffer)?;
+        let encoded = root.SerializeIntoBuffer(&mut buffer)?;
         total_size += encoded.len();
     }
     print_throughput_result(
@@ -566,7 +517,7 @@ fn benchmark_protocache_generated_serialize(
     Ok(())
 }
 
-fn traverse_pc_mutable_small(root: &mut pcrs_generated::test::SmallMutable, junk: &mut Junk) {
+fn traverse_pc_mutable_small(root: &mut pcrs_generated::SmallMutable, junk: &mut Junk) {
     junk.u32_sum = junk
         .u32_sum
         .wrapping_add(*root.i32() as u32)
@@ -574,7 +525,7 @@ fn traverse_pc_mutable_small(root: &mut pcrs_generated::test::SmallMutable, junk
     junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(root.str().as_bytes()));
 }
 
-fn traverse_pc_mutable_main(root: &mut pcrs_generated::test::MainMutable, junk: &mut Junk) {
+fn traverse_pc_mutable_main(root: &mut pcrs_generated::MainMutable, junk: &mut Junk) {
     junk.u32_sum = junk
         .u32_sum
         .wrapping_add(*root.i32() as u32)
@@ -1300,99 +1251,98 @@ fn traverse_pc_reflect_descriptor(
     descriptor: &ReflectDescriptorPlan,
     root: MessageView<'_>,
     junk: &mut Junk,
-) -> BenchResult<()> {
+) {
     for field in &descriptor.fields {
         let Some(value) = root.field(field.id) else {
             continue;
         };
-        traverse_pc_reflect_field(field, value, junk)?;
+        traverse_pc_reflect_field(field, value, junk);
     }
-    Ok(())
 }
 
 fn traverse_pc_reflect_field(
     field: &ReflectFieldPlan,
     value: FieldView<'_>,
     junk: &mut Junk,
-) -> BenchResult<()> {
+) {
     if let Some(key_type) = field.key {
-        let map = value.map().ok_or("invalid reflected map")?;
+        let map = value.expect_map();
         for pair in map.iter() {
             traverse_pc_reflect_map_key(key_type, pair.key(), junk);
-            traverse_pc_reflect_value(&field.value, pair.value(), junk)?;
+            traverse_pc_reflect_value(&field.value, pair.value(), junk);
         }
-        return Ok(());
+        return;
     }
 
     if field.repeated {
         match &field.value {
             ReflectValuePlan::Message { alias, descriptor } => {
                 if let Some(alias) = alias {
-                    let array = value.array().ok_or("invalid reflected alias array")?;
+                    let array = value.expect_array();
                     for item in array.iter() {
-                        traverse_pc_reflect_field(alias, item, junk)?;
+                        traverse_pc_reflect_field(alias, item, junk);
                     }
                 } else {
-                    let array = value.array().ok_or("invalid reflected message array")?;
-                    for item in ViewArray::<MessageView<'_>>::new(array).iter() {
+                    let array = value.expect_array();
+                    for item in array.iter() {
                         traverse_pc_reflect_descriptor(
-                            descriptor.as_deref().ok_or("missing reflected descriptor plan")?,
-                            item,
+                            descriptor.as_deref().expect("missing reflected descriptor plan"),
+                            item.expect_message(),
                             junk,
-                        )?;
+                        );
                     }
                 }
             }
             ReflectValuePlan::Bytes | ReflectValuePlan::String => {
-                let array = value.array().ok_or("invalid reflected string array")?;
+                let array = value.expect_array();
                 for item in array.iter() {
-                    traverse_pc_reflect_value(&field.value, item, junk)?;
+                    traverse_pc_reflect_value(&field.value, item, junk);
                 }
             }
             ReflectValuePlan::Double => {
-                let array = value.array().ok_or("invalid reflected double array")?;
-                for item in array.scalars::<f64>().ok_or("invalid reflected double scalars")?.iter() {
+                let array = value.expect_array();
+                for item in array.expect_scalars::<f64>().iter() {
                     junk.add_f64(item);
                 }
             }
             ReflectValuePlan::Float => {
-                let array = value.array().ok_or("invalid reflected float array")?;
-                for item in array.scalars::<f32>().ok_or("invalid reflected float scalars")?.iter() {
+                let array = value.expect_array();
+                for item in array.expect_scalars::<f32>().iter() {
                     junk.add_f32(item);
                 }
             }
             ReflectValuePlan::Uint64 => {
-                let array = value.array().ok_or("invalid reflected u64 array")?;
-                for item in array.scalars::<u64>().ok_or("invalid reflected u64 scalars")?.iter() {
+                let array = value.expect_array();
+                for item in array.expect_scalars::<u64>().iter() {
                     junk.u64_sum = junk.u64_sum.wrapping_add(item);
                 }
             }
             ReflectValuePlan::Uint32 => {
-                let array = value.array().ok_or("invalid reflected u32 array")?;
-                for item in array.scalars::<u32>().ok_or("invalid reflected u32 scalars")?.iter() {
+                let array = value.expect_array();
+                for item in array.expect_scalars::<u32>().iter() {
                     junk.u32_sum = junk.u32_sum.wrapping_add(item);
                 }
             }
             ReflectValuePlan::Int64 => {
-                let array = value.array().ok_or("invalid reflected i64 array")?;
-                for item in array.scalars::<i64>().ok_or("invalid reflected i64 scalars")?.iter() {
+                let array = value.expect_array();
+                for item in array.expect_scalars::<i64>().iter() {
                     junk.u64_sum = junk.u64_sum.wrapping_add(item as u64);
                 }
             }
             ReflectValuePlan::Int32 | ReflectValuePlan::Enum => {
-                let array = value.array().ok_or("invalid reflected i32 array")?;
-                for item in array.scalars::<i32>().ok_or("invalid reflected i32 scalars")?.iter() {
+                let array = value.expect_array();
+                for item in array.expect_scalars::<i32>().iter() {
                     junk.u32_sum = junk.u32_sum.wrapping_add(item as u32);
                 }
             }
             ReflectValuePlan::Bool => {
-                let bools = value.string().ok_or("invalid reflected bool array")?.as_bool_array();
+                let bools = value.expect_string().as_bool_array();
                 for item in bools.iter() {
                     junk.u32_sum = junk.u32_sum.wrapping_add(u32::from(item));
                 }
             }
         }
-        return Ok(());
+        return;
     }
 
     traverse_pc_reflect_value(&field.value, value, junk)
@@ -1401,32 +1351,31 @@ fn traverse_pc_reflect_field(
 fn traverse_pc_reflect_map_key(key_type: PcFieldType, key: FieldView<'_>, junk: &mut Junk) {
     match key_type {
         PcFieldType::String => {
-            if let Some(value) = key.string() {
-                junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(value.as_bytes()));
-            }
+            let value = key.expect_string();
+            junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(value.as_bytes()));
         }
         PcFieldType::Uint64 => {
             junk.u32_sum = junk
                 .u32_sum
-                .wrapping_add(key.scalar::<u64>().unwrap_or_default() as u32);
+                .wrapping_add(key.expect_scalar::<u64>() as u32);
         }
         PcFieldType::Uint32 => {
-            junk.u32_sum = junk.u32_sum.wrapping_add(key.scalar::<u32>().unwrap_or_default());
+            junk.u32_sum = junk.u32_sum.wrapping_add(key.expect_scalar::<u32>());
         }
         PcFieldType::Int64 => {
             junk.u32_sum = junk
                 .u32_sum
-                .wrapping_add(key.scalar::<i64>().unwrap_or_default() as u32);
+                .wrapping_add(key.expect_scalar::<i64>() as u32);
         }
         PcFieldType::Int32 | PcFieldType::Enum => {
             junk.u32_sum = junk
                 .u32_sum
-                .wrapping_add(key.scalar::<i32>().unwrap_or_default() as u32);
+                .wrapping_add(key.expect_scalar::<i32>() as u32);
         }
         PcFieldType::Bool => {
             junk.u32_sum = junk
                 .u32_sum
-                .wrapping_add(u32::from(key.scalar::<bool>().unwrap_or_default()));
+                .wrapping_add(u32::from(key.expect_scalar::<bool>()));
         }
         PcFieldType::Message
         | PcFieldType::Bytes
@@ -1441,54 +1390,52 @@ fn traverse_pc_reflect_value(
     field: &ReflectValuePlan,
     value: FieldView<'_>,
     junk: &mut Junk,
-) -> BenchResult<()> {
+) {
     match field {
         ReflectValuePlan::Message { alias, descriptor } => {
             if let Some(alias) = alias {
-                traverse_pc_reflect_field(alias, value, junk)?;
-            } else if let Some(message) = value.message() {
+                traverse_pc_reflect_field(alias, value, junk);
+            } else {
+                let message = value.expect_message();
                 traverse_pc_reflect_descriptor(
-                    descriptor.as_deref().ok_or("missing reflected descriptor plan")?,
+                    descriptor.as_deref().expect("missing reflected descriptor plan"),
                     message,
                     junk,
-                )?;
+                );
             }
         }
         ReflectValuePlan::Bytes => {
-            if let Some(bytes) = value.string() {
-                junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(bytes.as_bytes()));
-            }
+            let bytes = value.expect_string();
+            junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(bytes.as_bytes()));
         }
         ReflectValuePlan::String => {
-            if let Some(string) = value.string() {
-                junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(string.as_bytes()));
-            }
+            let string = value.expect_string();
+            junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(string.as_bytes()));
         }
-        ReflectValuePlan::Double => junk.add_f64(value.scalar::<f64>().unwrap_or_default()),
-        ReflectValuePlan::Float => junk.add_f32(value.scalar::<f32>().unwrap_or_default()),
+        ReflectValuePlan::Double => junk.add_f64(value.expect_scalar::<f64>()),
+        ReflectValuePlan::Float => junk.add_f32(value.expect_scalar::<f32>()),
         ReflectValuePlan::Uint64 => {
-            junk.u64_sum = junk.u64_sum.wrapping_add(value.scalar::<u64>().unwrap_or_default());
+            junk.u64_sum = junk.u64_sum.wrapping_add(value.expect_scalar::<u64>());
         }
         ReflectValuePlan::Uint32 => {
-            junk.u32_sum = junk.u32_sum.wrapping_add(value.scalar::<u32>().unwrap_or_default());
+            junk.u32_sum = junk.u32_sum.wrapping_add(value.expect_scalar::<u32>());
         }
         ReflectValuePlan::Int64 => {
             junk.u64_sum = junk
                 .u64_sum
-                .wrapping_add(value.scalar::<i64>().unwrap_or_default() as u64);
+                .wrapping_add(value.expect_scalar::<i64>() as u64);
         }
         ReflectValuePlan::Int32 | ReflectValuePlan::Enum => {
             junk.u32_sum = junk
                 .u32_sum
-                .wrapping_add(value.scalar::<i32>().unwrap_or_default() as u32);
+                .wrapping_add(value.expect_scalar::<i32>() as u32);
         }
         ReflectValuePlan::Bool => {
             junk.u32_sum = junk
                 .u32_sum
-                .wrapping_add(u32::from(value.scalar::<bool>().unwrap_or_default()));
+                .wrapping_add(u32::from(value.expect_scalar::<bool>()));
         }
     }
-    Ok(())
 }
 
 fn traverse_pb_reflect_descriptor(
@@ -1601,7 +1548,4 @@ fn traverse_pb_reflect_value(
 }
 
 #[cfg(test)]
-mod benchmark_tests;
-fn words_as_bytes(words: &[u32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words)) }
-}
+mod tests;

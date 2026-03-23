@@ -3,17 +3,70 @@ use prost_reflect::{DescriptorPool, DynamicMessage, MapKey as ReflectMapKey, Val
 use protocache_core::{MapView, MessageView};
 use std::collections::HashMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::TempDir;
 
 use crate::serialize::serialize_protobuf_bytes;
 use crate::utils::{dump_json, load_json, parse_proto, parse_proto_file, serialize_dynamic};
 
-fn fixture_schema() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/proto/test.proto")
+const BASIC_SCHEMA: &str = r#"
+syntax = "proto3";
+
+package test;
+
+message Small {
+    int32 i32 = 1;
+    bool flag = 2;
+    string str = 4;
+}
+
+message Main {
+    int32 i32 = 1;
+    string str = 7;
+    Small object = 11;
+    repeated int32 i32v = 12;
+    map<string, int32> index = 26;
+}
+"#;
+
+const ALIAS_SCHEMA: &str = r#"
+syntax = "proto3";
+
+package test;
+
+message Vec2D {
+    message Vec1D {
+        repeated float _ = 1;
+    }
+    repeated Vec1D _ = 1;
+}
+
+message ArrMap {
+    message Array {
+        repeated float _ = 1;
+    }
+    map<string, Array> _ = 1;
+}
+
+message Main {
+    Vec2D matrix = 28;
+    ArrMap arrays = 30;
+}
+"#;
+
+fn write_test_schema_file(contents: &str) -> (TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("pcrs-ext-schema-")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("test.proto");
+    fs::write(&path, contents).unwrap();
+    (dir, path)
 }
 
 fn load_reflect_descriptor_pool_from_proto_file(
-    path: impl AsRef<std::path::Path>,
+    path: impl AsRef<Path>,
 ) -> Result<DescriptorPool, crate::utils::ProtoError> {
     let file = parse_proto_file(path)?;
     DescriptorPool::from_file_descriptor_set(prost_types::FileDescriptorSet { file: vec![file] })
@@ -22,7 +75,7 @@ fn load_reflect_descriptor_pool_from_proto_file(
 
 #[test]
 fn serializes_dynamic_message_via_read_only_reflection() {
-    let schema = fixture_schema();
+    let (_dir, schema) = write_test_schema_file(BASIC_SCHEMA);
     let pool = load_reflect_descriptor_pool_from_proto_file(&schema).unwrap();
     let descriptor = pool.get_message_by_name("test.Main").unwrap();
     let small_descriptor = pool.get_message_by_name("test.Small").unwrap();
@@ -59,7 +112,7 @@ fn serializes_dynamic_message_via_read_only_reflection() {
 
 #[test]
 fn protobuf_bytes_and_prost_entry_points_match() {
-    let schema = fixture_schema();
+    let (_dir, schema) = write_test_schema_file(BASIC_SCHEMA);
     let pool = load_reflect_descriptor_pool_from_proto_file(&schema).unwrap();
     let descriptor = pool.get_message_by_name("test.Main").unwrap();
 
@@ -81,7 +134,7 @@ fn protobuf_bytes_and_prost_entry_points_match() {
 
 #[test]
 fn serializes_alias_fields_without_mutable_runtime() {
-    let schema = fixture_schema();
+    let (_dir, schema) = write_test_schema_file(ALIAS_SCHEMA);
     let pool = load_reflect_descriptor_pool_from_proto_file(&schema).unwrap();
     let descriptor = pool.get_message_by_name("test.Main").unwrap();
     let vec2d = pool.get_message_by_name("test.Vec2D").unwrap();
@@ -151,7 +204,7 @@ fn unique_temp_json_path(name: &str) -> std::path::PathBuf {
 
 #[test]
 fn loads_and_dumps_json_via_reflection() {
-    let schema = fixture_schema();
+    let (_dir, schema) = write_test_schema_file(BASIC_SCHEMA);
     let pool = load_reflect_descriptor_pool_from_proto_file(&schema).unwrap();
     let descriptor = pool.get_message_by_name("test.Main").unwrap();
     let json_path = unique_temp_json_path("roundtrip");
