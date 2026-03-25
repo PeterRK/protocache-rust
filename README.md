@@ -15,18 +15,18 @@ Using the local Rust harness in `protocache-test` on the bundled benchmark fixtu
 |  | Protobuf | ProtoCache | FlatBuffers |
 |:-------|----:|----:|----:|
 | Data Size | **574B** | 780B | 1296B |
-| Decode + Traverse + Dealloc | 3071ns | **304ns** | 374ns |
-| Decode + Traverse(reflection) + Dealloc | 15129ns | **610ns** | - |
+| Decode + Traverse + Dealloc | 2701ns | **294ns** | 466ns |
+| Decode + Traverse(reflection) + Dealloc | 14121ns | **652ns** | - |
 | Compressed Size | 566B | 571B | 856B |
-| Compress | 531ns | 1054ns | 2022ns |
-| Decompress | 363ns | 967ns | 1898ns |
+| Compress | 377ns | 688ns | 1235ns |
+| Decompress | 164ns | 395ns | 849ns |
 
 Mutable/serialize paths from the same Rust benchmark:
 
 | | Protobuf | ProtoCacheEX | ProtoCache |
 |:-------|----:|----:|----:|
-| Serialize | **1134ns** | 859 ~ 6478ns | 16216ns |
-| Decode + Traverse + Dealloc | 3071ns | 2680ns | **304ns** |
+| Serialize | **1167ns** | 735 ~ 4110ns | 13917ns |
+| Decode + Traverse + Dealloc | 2701ns | 2195ns | **294ns** |
 
 Run it with:
 

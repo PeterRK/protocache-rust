@@ -152,11 +152,7 @@ fn pick_unit(unit: &mut Unit, buffer: &mut Buffer, tail: &mut usize, width: usiz
 
 #[inline(always)]
 fn mark_unit(unit: &Unit, buffer: &mut Buffer, width: usize) {
-    let segment_offset = if unit.inline_len == 0 {
-        Some(offset(buffer.len() - unit.segment.pos))
-    } else {
-        None
-    };
+    let expanded_len = buffer.len() + width;
     let cell = buffer.expand(width);
     if unit.inline_len != 0 {
         cell[..unit.inline_len].copy_from_slice(unit.inline_words());
@@ -164,7 +160,7 @@ fn mark_unit(unit: &Unit, buffer: &mut Buffer, width: usize) {
             *word = 0;
         }
     } else {
-        cell[0] = segment_offset.expect("segment offset must exist for segmented unit");
+        cell[0] = offset(expanded_len - unit.segment.pos);
         for word in &mut cell[1..] {
             *word = 0;
         }
@@ -203,6 +199,54 @@ fn best_array_size(elements: &[Unit]) -> (usize, usize) {
 }
 
 #[inline(always)]
+fn best_array_size_pairs(elements: &[(Unit, Unit)]) -> ((usize, usize), (usize, usize)) {
+    let mut key_sizes = [0usize; 3];
+    let mut value_sizes = [0usize; 3];
+    for (key, value) in elements {
+        for sizes in [&mut key_sizes, &mut value_sizes] {
+            sizes[0] += 1;
+            sizes[1] += 2;
+            sizes[2] += 3;
+        }
+
+        let key_len = key.size();
+        if key_len > 1 {
+            key_sizes[0] += key_len;
+            if key_len > 2 {
+                key_sizes[1] += key_len;
+                if key_len > 3 {
+                    key_sizes[2] += key_len;
+                }
+            }
+        }
+
+        let value_len = value.size();
+        if value_len > 1 {
+            value_sizes[0] += value_len;
+            if value_len > 2 {
+                value_sizes[1] += value_len;
+                if value_len > 3 {
+                    value_sizes[2] += value_len;
+                }
+            }
+        }
+    }
+
+    let mut key_mode = 0usize;
+    let mut value_mode = 0usize;
+    for idx in 1..3 {
+        if key_sizes[idx] < key_sizes[key_mode] {
+            key_mode = idx;
+        }
+        if value_sizes[idx] < value_sizes[value_mode] {
+            value_mode = idx;
+        }
+    }
+
+    ((key_sizes[key_mode], key_mode + 1), (value_sizes[value_mode], value_mode + 1))
+}
+
+#[inline(always)]
 fn perfect_hash_section(size: usize) -> usize {
     ((size * 105).saturating_add(255) / 256).max(10)
 }
@@ -232,40 +276,81 @@ struct Edge {
 
 #[inline(always)]
 fn peel_graph(edges: &[Edge], slot_cnt: usize) -> Option<Vec<usize>> {
-    let mut adjacency = vec![Vec::<usize>::new(); slot_cnt];
-    let mut degree = vec![0usize; slot_cnt];
-    for (idx, edge) in edges.iter().enumerate() {
-        for &slot in &edge.slots {
-            adjacency[slot].push(idx);
-            degree[slot] += 1;
+    const NONE: usize = usize::MAX;
+
+    #[derive(Clone, Copy)]
+    struct Vertex {
+        slot: usize,
+        prev: usize,
+        next: usize,
+    }
+
+    let mut heads = vec![NONE; slot_cnt];
+    let mut vertices = vec![
+        Vertex {
+            slot: NONE,
+            prev: NONE,
+            next: NONE,
+        };
+        edges.len() * 3
+    ];
+
+    for (edge_idx, edge) in edges.iter().enumerate() {
+        for (slot_index, &slot) in edge.slots.iter().enumerate() {
+            let node = edge_idx * 3 + slot_index;
+            let head = heads[slot];
+            vertices[node] = Vertex {
+                slot,
+                prev: NONE,
+                next: head,
+            };
+            if head != NONE {
+                vertices[head].prev = node;
+            }
+            heads[slot] = node;
         }
     }
 
-    let mut queue = std::collections::VecDeque::new();
-    for (slot, &deg) in degree.iter().enumerate() {
-        if deg == 1 {
-            queue.push_back(slot);
+    let mut queue = Vec::with_capacity(slot_cnt);
+    for (slot, &head) in heads.iter().enumerate() {
+        if head != NONE && vertices[head].next == NONE {
+            queue.push(slot);
         }
     }
+    let mut queue_head = 0usize;
 
-    let mut removed = vec![false; edges.len()];
     let mut order = Vec::with_capacity(edges.len());
 
-    while let Some(slot) = queue.pop_front() {
-        if degree[slot] != 1 {
+    while let Some(&slot) = queue.get(queue_head) {
+        queue_head += 1;
+        let head = heads[slot];
+        if head == NONE || vertices[head].next != NONE {
             continue;
         }
-        let edge_idx = adjacency[slot].iter().copied().find(|&idx| !removed[idx])?;
-        removed[edge_idx] = true;
+        let edge_idx = head / 3;
         order.push(edge_idx);
-        for &other in &edges[edge_idx].slots {
-            if degree[other] == 0 {
+
+        for offset in 0..3 {
+            let node = edge_idx * 3 + offset;
+            let vertex = vertices[node];
+            if vertex.slot == NONE {
                 continue;
             }
-            degree[other] -= 1;
-            if degree[other] == 1 {
-                queue.push_back(other);
+
+            if vertex.prev != NONE {
+                vertices[vertex.prev].next = vertex.next;
+            } else {
+                heads[vertex.slot] = vertex.next;
             }
+            if vertex.next != NONE {
+                vertices[vertex.next].prev = vertex.prev;
+            }
+
+            let head = heads[vertex.slot];
+            if head != NONE && vertices[head].next == NONE {
+                queue.push(vertex.slot);
+            }
+            vertices[node].slot = NONE;
         }
     }
 
@@ -278,14 +363,9 @@ fn peel_graph(edges: &[Edge], slot_cnt: usize) -> Option<Vec<usize>> {
 
 #[inline(always)]
 fn count_valid_slots(bitmap: &[u8], block: usize) -> usize {
-    let start = block * 32;
-    let mut count = 0usize;
-    for pos in start..start + 32 {
-        if get_bit2(bitmap, pos) != 3 {
-            count += 1;
-        }
-    }
-    count
+    let start = block * 8;
+    let bits = u64::from_le_bytes(bitmap[start..start + 8].try_into().expect("bitmap block must fit"));
+    count_valid_slots_in_word(bits)
 }
 
 #[inline(always)]
@@ -295,15 +375,17 @@ fn locate_in_perfect_hash(index: &[u8], key: &[u8]) -> Option<usize> {
         return Some(0);
     }
     let section = perfect_hash_section(size);
+    let section_u32 = section as u32;
+    let section_magic = fast_mod_magic(section_u32);
     let bitmap_size = perfect_hash_bitmap_size(section);
     let bitmap = index.get(8..8 + bitmap_size)?;
     let table = index.get(8 + bitmap_size..)?;
     let seed = u32::from_le_bytes(index.get(4..8)?.try_into().ok()?) as u64;
     let code = hash128(key, seed);
     let slots = [
-        code[0] as usize % section,
-        code[1] as usize % section + section,
-        code[2] as usize % section + section * 2,
+        fast_mod_u32(code[0], section_u32, section_magic) as usize,
+        fast_mod_u32(code[1], section_u32, section_magic) as usize + section,
+        fast_mod_u32(code[2], section_u32, section_magic) as usize + section * 2,
     ];
     let m = get_bit2(bitmap, slots[0]) as usize
         + get_bit2(bitmap, slots[1]) as usize
@@ -322,11 +404,27 @@ fn locate_in_perfect_hash(index: &[u8], key: &[u8]) -> Option<usize> {
         0
     };
 
-    let start = block * 32;
-    let rank = (start..start + bit + 1)
-        .filter(|&pos| get_bit2(bitmap, pos) != 3)
-        .count();
-    Some(off + rank - 1)
+    let word_start = block * 8;
+    let bits = u64::from_le_bytes(bitmap.get(word_start..word_start + 8)?.try_into().ok()?);
+    let masked = bits | (u64::MAX << (bit << 1));
+    Some(off + count_valid_slots_in_word(masked))
+}
+
+#[inline(always)]
+fn count_valid_slots_in_word(bits: u64) -> usize {
+    let invalid = ((bits & 0x5555_5555_5555_5555) & (bits >> 1)).count_ones() as usize;
+    32 - invalid
+}
+
+#[inline(always)]
+fn fast_mod_magic(divisor: u32) -> u64 {
+    u64::MAX / divisor as u64 + 1
+}
+
+#[inline(always)]
+fn fast_mod_u32(value: u32, divisor: u32, magic: u64) -> u32 {
+    let low = magic.wrapping_mul(value as u64);
+    (((low as u128) * divisor as u128) >> 64) as u32
 }
 
 #[inline(always)]
@@ -347,6 +445,8 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
     }
 
     let section = perfect_hash_section(total);
+    let section_u32 = section as u32;
+    let section_magic = fast_mod_magic(section_u32);
     let slot_cnt = section * 3;
     let bitmap_size = perfect_hash_bitmap_size(section);
 
@@ -358,9 +458,9 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
                 let code = hash128(key.as_ref(), seed as u64);
                 Edge {
                     slots: [
-                        code[0] as usize % section,
-                        code[1] as usize % section + section,
-                        code[2] as usize % section + section * 2,
+                        fast_mod_u32(code[0], section_u32, section_magic) as usize,
+                        fast_mod_u32(code[1], section_u32, section_magic) as usize + section,
+                        fast_mod_u32(code[2], section_u32, section_magic) as usize + section * 2,
                     ],
                 }
             })
@@ -426,10 +526,10 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
         }
     }
 
-    let positions = keys
-        .iter()
-        .map(|key| locate_in_perfect_hash(&out, key.as_ref()))
-        .collect::<Option<Vec<_>>>()?;
+    let mut positions = Vec::with_capacity(keys.len());
+    for key in keys.iter() {
+        positions.push(locate_in_perfect_hash(&out, key.as_ref())?);
+    }
 
     Some((out, positions))
 }
@@ -689,6 +789,43 @@ pub fn serialize_map_at_mut(
     for index in (0..keys.len()).rev() {
         mark_unit(&values[index], buffer, value_width);
         mark_unit(&keys[index], buffer, key_width);
+    }
+
+    let head = buffer.expand(index_words);
+    head.fill(0);
+    let raw = unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
+    raw[..index.len()].copy_from_slice(index);
+    head[0] |= (key_width as u32) << 30 | (value_width as u32) << 28;
+    Some(Unit::segment(last, buffer.len()))
+}
+
+#[inline(always)]
+pub(crate) fn serialize_map_pairs_at_mut(
+    index: &[u8],
+    pairs: &mut [(Unit, Unit)],
+    buffer: &mut Buffer,
+    last: usize,
+) -> Option<Unit> {
+    if pairs.is_empty() {
+        return Some(Unit::inline(&[5u32 << 28]));
+    }
+
+    let ((key_size, key_width), (value_size, value_width)) = best_array_size_pairs(pairs);
+    let index_words = index.len().div_ceil(4);
+    let size = index_words + key_size + value_size;
+    if size >= (1usize << 30) {
+        return None;
+    }
+
+    let mut tail = buffer.len().checked_sub(last)?;
+    for (key, value) in pairs.iter_mut().rev() {
+        pick_unit(value, buffer, &mut tail, value_width);
+        pick_unit(key, buffer, &mut tail, key_width);
+    }
+    buffer.shrink(tail);
+    for (key, value) in pairs.iter().rev() {
+        mark_unit(value, buffer, value_width);
+        mark_unit(key, buffer, key_width);
     }
 
     let head = buffer.expand(index_words);

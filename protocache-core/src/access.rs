@@ -1059,9 +1059,13 @@ pub fn detect_array_with<'a>(
     mut detect: impl FnMut(FieldView<'a>) -> Option<&'a [u32]>,
 ) -> Option<&'a [u32]> {
     let array = ArrayView::new(words)?;
-    let mut end = ArrayView::detect_len(words)?;
-    for item in array.iter() {
-        detect_slice_end(words, detect(item)?, &mut end)?;
+    let end = ArrayView::detect_len(words)?;
+    for index in (0..array.len()).rev() {
+        let detected = detect(array.field(index)?)?;
+        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
+            return words.get(..offset.checked_add(detected.len())?);
+        }
     }
     words.get(..end)
 }
@@ -1073,10 +1077,20 @@ pub fn detect_map_with<'a>(
     mut detect_value: impl FnMut(FieldView<'a>) -> Option<&'a [u32]>,
 ) -> Option<&'a [u32]> {
     let map = MapView::new(words)?;
-    let mut end = MapView::detect_len(words)?;
-    for pair in map.iter() {
-        detect_slice_end(words, detect_key(pair.key())?, &mut end)?;
-        detect_slice_end(words, detect_value(pair.value())?, &mut end)?;
+    let end = MapView::detect_len(words)?;
+    for index in (0..map.len()).rev() {
+        let pair = map.pair(index)?;
+        let detected = detect_value(pair.value())?;
+        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
+            return words.get(..offset.checked_add(detected.len())?);
+        }
+
+        let detected = detect_key(pair.key())?;
+        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
+            return words.get(..offset.checked_add(detected.len())?);
+        }
     }
     words.get(..end)
 }

@@ -2,14 +2,16 @@
 
 use std::collections::HashMap;
 use std::borrow::Borrow;
+use std::array;
 use std::hash::Hash;
 use std::marker::PhantomData;
 
 use crate::{
     ArrayView, Buffer, FieldView, MapKey, MapView, MessageView, Scalar, StringView, Unit,
     build_perfect_hash_index_with_positions, fold_field, serialize_array_at_mut, serialize_bool,
-    serialize_bytes, serialize_map_at_mut, serialize_scalar, serialize_str, detect_slice_end,
+    serialize_bytes, serialize_scalar, serialize_str,
 };
+use crate::serialize::serialize_map_pairs_at_mut;
 
 #[derive(Debug)]
 pub enum MutableError {
@@ -442,20 +444,19 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
             },
         )?;
 
-        let mut book = vec![0usize; memo.len()];
+        let mut book = vec![memo[0]; memo.len()];
         for (idx, position) in positions.into_iter().enumerate() {
-            book[position] = idx;
+            book[position] = memo[idx];
         }
 
-        let mut keys = vec![Unit::empty(); book.len()];
-        let mut values = vec![Unit::empty(); book.len()];
+        let mut pairs = vec![(Unit::empty(), Unit::empty()); book.len()];
         for i in (0..book.len()).rev() {
-            let (key, value) = memo[book[i]];
-            values[i] = value.encode(buffer)?;
-            keys[i] = key.encode_key(buffer)?;
+            let (key, value) = book[i];
+            pairs[i].1 = value.encode(buffer)?;
+            pairs[i].0 = key.encode_key(buffer)?;
         }
 
-        serialize_map_at_mut(&index, &mut keys, &mut values, buffer, last).ok_or_else(|| MutableError::SerializeFailed {
+        serialize_map_pairs_at_mut(&index, &mut pairs, buffer, last).ok_or_else(|| MutableError::SerializeFailed {
             descriptor: "<map>".to_owned(),
             field: "<encode>".to_owned(),
         })
@@ -464,19 +465,33 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
 
 fn detect_array_words<'a, T: MutableField<'a>>(words: &'a [u32]) -> Option<&'a [u32]> {
     let array = ArrayView::new(words)?;
-    let mut end = ArrayView::detect_len(words)?;
-    for item in array.iter() {
-        detect_slice_end(words, T::detect(item)?, &mut end)?;
+    let end = ArrayView::detect_len(words)?;
+    for index in (0..array.len()).rev() {
+        let detected = T::detect(array.field(index)?)?;
+        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
+            return words.get(..offset.checked_add(detected.len())?);
+        }
     }
     words.get(..end)
 }
 
 fn detect_map_words<'a, K: MutableMapKey<'a>, V: MutableField<'a>>(words: &'a [u32]) -> Option<&'a [u32]> {
     let map = MapView::new(words)?;
-    let mut end = MapView::detect_len(words)?;
-    for pair in map.iter() {
-        detect_slice_end(words, K::detect_key(pair.key())?, &mut end)?;
-        detect_slice_end(words, V::detect(pair.value())?, &mut end)?;
+    let end = MapView::detect_len(words)?;
+    for index in (0..map.len()).rev() {
+        let pair = map.pair(index)?;
+        let detected = V::detect(pair.value())?;
+        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
+            return words.get(..offset.checked_add(detected.len())?);
+        }
+
+        let detected = K::detect_key(pair.key())?;
+        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
+            return words.get(..offset.checked_add(detected.len())?);
+        }
     }
     words.get(..end)
 }
@@ -1005,10 +1020,23 @@ impl<'a, T: MutableField<'a>> MutableField<'a> for Box<T> {
 }
 
 fn encode_object_array<'a, T: MutableField<'a>>(values: &[T], buffer: &mut Buffer) -> Result<Unit, MutableError> {
+    const STACK_UNITS: usize = 32;
+
     if values.is_empty() {
         return Ok(Unit::inline(&[1]));
     }
     let last = buffer.len();
+    if values.len() <= STACK_UNITS {
+        let mut units = array::from_fn::<_, STACK_UNITS, _>(|_| Unit::empty());
+        for i in (0..values.len()).rev() {
+            units[i] = values[i].encode(buffer)?;
+        }
+        return serialize_array_at_mut(&mut units[..values.len()], buffer, last).ok_or_else(|| MutableError::SerializeFailed {
+            descriptor: "<array>".to_owned(),
+            field: "<encode>".to_owned(),
+        });
+    }
+
     let mut units = vec![Unit::empty(); values.len()];
     for i in (0..values.len()).rev() {
         units[i] = values[i].encode(buffer)?;
@@ -1023,7 +1051,7 @@ fn encode_object_array<'a, T: MutableField<'a>>(values: &[T], buffer: &mut Buffe
 mod tests {
     use super::{MutableArray, MutableMap, drop_present_unit, should_omit_message_unit};
     use crate::mutable::MutableField;
-    use crate::{Buffer, Unit};
+    use crate::{ArrayView, Buffer, MapView, Unit};
 
     #[test]
     fn array_ex_iter_mut_marks_collection_dirty() {
@@ -1092,5 +1120,57 @@ mod tests {
 
         assert!(buffer.is_empty());
         assert!(unit.is_empty());
+    }
+
+    #[test]
+    fn mutable_nested_float_arrays_roundtrip() {
+        let mut rows = MutableArray::new();
+        rows.push(MutableArray::new());
+        rows.push(MutableArray::from(vec![7.0f32, 8.0, 9.0]));
+
+        let mut buffer = Buffer::new();
+        let unit = rows.encode(&mut buffer).unwrap();
+        assert!(unit.is_segment());
+
+        let view = ArrayView::new(buffer.view()).unwrap();
+        assert_eq!(view.len(), 2);
+
+        let row0 = ArrayView::new(view.field(0).unwrap().object_words().unwrap()).unwrap();
+        assert!(row0.scalars::<f32>().unwrap().is_empty());
+
+        let row1_words = view.field(1).unwrap().object_words().unwrap();
+        let row1 = ArrayView::new(row1_words).unwrap();
+        assert_eq!(row1.width(), 1, "row1 words: {:?}", row1_words);
+        assert_eq!(
+            row1.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
+            vec![7.0, 8.0, 9.0]
+        );
+    }
+
+    #[test]
+    fn mutable_string_key_float_array_map_roundtrip() {
+        let mut map = MutableMap::new();
+        map.insert("lv5".to_owned(), MutableArray::from(vec![51.0f32, 52.0, 53.0]));
+        map.insert("lv9".to_owned(), MutableArray::from(vec![91.0f32, 92.0]));
+
+        let mut buffer = Buffer::new();
+        let unit = map.encode(&mut buffer).unwrap();
+        assert!(unit.is_segment());
+
+        let view = MapView::new(buffer.view()).unwrap();
+        let available = view
+            .iter()
+            .filter_map(|pair| pair.key().string().and_then(|key| key.as_str().map(str::to_owned)))
+            .collect::<Vec<_>>();
+        let lv5 = view.find_str("lv5").unwrap_or_else(|| panic!("available keys: {available:?}, words: {:?}", buffer.view())).value().array().unwrap();
+        assert_eq!(
+            lv5.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
+            vec![51.0, 52.0, 53.0]
+        );
+        let lv9 = view.find_str("lv9").unwrap().value().array().unwrap();
+        assert_eq!(
+            lv9.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
+            vec![91.0, 92.0]
+        );
     }
 }

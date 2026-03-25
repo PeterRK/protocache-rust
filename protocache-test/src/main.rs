@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use prost::Message;
 use prost_reflect::{
     DescriptorError as ReflectDescriptorError,
@@ -156,6 +159,7 @@ impl Junk {
 
 struct BenchConfig {
     loops: usize,
+    only: Option<String>,
 }
 
 #[derive(Clone)]
@@ -218,6 +222,7 @@ enum PbReflectValuePlan {
 impl BenchConfig {
     fn from_args() -> Result<Self, String> {
         let mut loops = DEFAULT_LOOPS;
+        let mut only = None;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -227,14 +232,27 @@ impl BenchConfig {
                         .parse()
                         .map_err(|_| format!("invalid --loops value: {value}"))?;
                 }
+                "--only" => {
+                    let value = args.next().ok_or("--only requires a value")?;
+                    only = Some(value);
+                }
                 "--help" | "-h" => {
-                    println!("Usage: cargo run -p protocache-test --release -- [--loops N]");
+                    println!("Usage: cargo run -p protocache-test --release -- [--loops N] [--only NAME]");
                     std::process::exit(0);
                 }
                 _ => return Err(format!("unknown argument: {arg}")),
             }
         }
-        Ok(Self { loops })
+        Ok(Self { loops, only })
+    }
+}
+
+impl BenchConfig {
+    fn should_run(&self, name: &str) -> bool {
+        match &self.only {
+            None => true,
+            Some(only) => only == name,
+        }
     }
 }
 
@@ -249,23 +267,62 @@ fn main() -> BenchResult<()> {
     let protocache_words = bytes_to_words(&protocache_raw);
     let protocache_dynamic = load_benchmark_dynamic_message(&protobuf_raw, &schema_path)?;
 
-    benchmark_protobuf(&protobuf_raw, config.loops)?;
-    benchmark_flatbuffers(&flatbuffers_raw, config.loops)?;
-    benchmark_protocache(&protocache_words, &protocache_raw, config.loops)?;
-    benchmark_protobuf_reflect(&schema_path, &protobuf_raw, config.loops)?;
-    benchmark_protocache_reflect(&schema_path, &protocache_words, config.loops)?;
-    benchmark_protocache_ex(&protocache_words, &protocache_raw, config.loops)?;
+    if config.should_run("protobuf") {
+        benchmark_protobuf(&protobuf_raw, config.loops)?;
+    }
+    if config.should_run("flatbuffers") {
+        benchmark_flatbuffers(&flatbuffers_raw, config.loops)?;
+    }
+    if config.should_run("protocache") {
+        benchmark_protocache(&protocache_words, &protocache_raw, config.loops)?;
+    }
+    if config.should_run("protobuf-reflect") {
+        benchmark_protobuf_reflect(&schema_path, &protobuf_raw, config.loops)?;
+    }
+    if config.should_run("protocache-reflect") {
+        benchmark_protocache_reflect(&schema_path, &protocache_words, config.loops)?;
+    }
+    if config.should_run("protocache-ex") {
+        benchmark_protocache_ex(&protocache_words, &protocache_raw, config.loops)?;
+    }
 
-    println!("========serialize========");
-    benchmark_protobuf_serialize(&protobuf_raw, config.loops)?;
-    benchmark_dynamic_to_protocache_serialize(&protocache_dynamic, config.loops)?;
-    benchmark_protocache_generated_serialize(&protocache_words, false, config.loops)?;
-    benchmark_protocache_generated_serialize(&protocache_words, true, config.loops)?;
+    if config.only.is_none()
+        || config.should_run("protobuf-serialize")
+        || config.should_run("protocache-serialize")
+        || config.should_run("protocache-fully")
+        || config.should_run("protocache-partly")
+    {
+        println!("========serialize========");
+    }
+    if config.should_run("protobuf-serialize") {
+        benchmark_protobuf_serialize(&protobuf_raw, config.loops)?;
+    }
+    if config.should_run("protocache-serialize") {
+        benchmark_dynamic_to_protocache_serialize(&protocache_dynamic, config.loops)?;
+    }
+    if config.should_run("protocache-fully") {
+        benchmark_protocache_generated_serialize(&protocache_words, false, config.loops)?;
+    }
+    if config.should_run("protocache-partly") {
+        benchmark_protocache_generated_serialize(&protocache_words, true, config.loops)?;
+    }
 
-    println!("========compress========");
-    benchmark_compress("pb", &protobuf_raw, config.loops)?;
-    benchmark_compress("pc", &protocache_raw, config.loops)?;
-    benchmark_compress("fb", &flatbuffers_raw, config.loops)?;
+    if config.only.is_none()
+        || config.should_run("pb-compress")
+        || config.should_run("pc-compress")
+        || config.should_run("fb-compress")
+    {
+        println!("========compress========");
+    }
+    if config.should_run("pb-compress") {
+        benchmark_compress("pb", &protobuf_raw, config.loops)?;
+    }
+    if config.should_run("pc-compress") {
+        benchmark_compress("pc", &protocache_raw, config.loops)?;
+    }
+    if config.should_run("fb-compress") {
+        benchmark_compress("fb", &flatbuffers_raw, config.loops)?;
+    }
     Ok(())
 }
 

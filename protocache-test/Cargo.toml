@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 flatbuffers = "=2.1.2"
+mimalloc = { version = "0.1", default-features = false }
 prost = "0.13.5"
 prost-reflect = "0.15.0"
 protocache-core = { path = "../protocache-core" }

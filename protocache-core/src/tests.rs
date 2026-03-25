@@ -1,4 +1,7 @@
-use crate::{ArrayView, MapView, MessageView, StringView};
+use crate::{
+    ArrayView, Buffer, MapView, MessageView, StringView, Unit, build_perfect_hash_index_with_positions,
+    detect_array_with, detect_map_with, serialize_map, serialize_str,
+};
 
 #[test]
 fn reads_scalar_message() {
@@ -42,4 +45,71 @@ fn detect_returns_precise_object_ranges() {
     let root = MessageView::new(&string_msg).unwrap();
     assert_eq!(root.field(0).unwrap().detect_string().unwrap(), &string_msg[2..3]);
     assert_eq!(StringView::detect(&string_msg[2..]).unwrap(), &string_msg[2..3]);
+}
+
+#[test]
+fn detect_array_stops_after_last_extending_item() {
+    let mut buffer = Buffer::new();
+    let short = serialize_str("abc", &mut buffer).unwrap();
+    let long = serialize_str("this string spills past the array body", &mut buffer).unwrap();
+    let _array = crate::serialize_array(&[short, long], &mut buffer).unwrap();
+    let words = buffer.view();
+
+    let mut calls = 0usize;
+    let detected = detect_array_with(words, |field| {
+        calls += 1;
+        field.detect_string()
+    })
+    .unwrap();
+
+    assert!(detected.len() > ArrayView::detect_len(words).unwrap());
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn detect_map_stops_after_last_extending_value() {
+    let keys_src = vec![b"k0".to_vec(), b"k1".to_vec()];
+    let (index, positions) = build_perfect_hash_index_with_positions(&keys_src).unwrap();
+
+    let mut buffer = Buffer::new();
+    let key0 = serialize_str("k0", &mut buffer).unwrap();
+    let key1 = serialize_str("k1", &mut buffer).unwrap();
+    let short = serialize_str("x", &mut buffer).unwrap();
+    let long = serialize_str("this map value spills past the map body", &mut buffer).unwrap();
+
+    let last = positions
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, pos)| *pos)
+        .map(|(idx, _)| idx)
+        .unwrap();
+
+    let mut keys = vec![Unit::empty(); 2];
+    let mut values = vec![Unit::empty(); 2];
+    keys[positions[0]] = key0;
+    keys[positions[1]] = key1;
+    values[positions[last]] = long;
+    values[positions[1 - last]] = short;
+
+    let _map = serialize_map(&index, &keys, &values, &mut buffer).unwrap();
+    let words = buffer.view();
+
+    let mut key_calls = 0usize;
+    let mut value_calls = 0usize;
+    let detected = detect_map_with(
+        words,
+        |field| {
+            key_calls += 1;
+            field.detect_string()
+        },
+        |field| {
+            value_calls += 1;
+            field.detect_string()
+        },
+    )
+    .unwrap();
+
+    assert!(detected.len() > MapView::detect_len(words).unwrap());
+    assert_eq!(value_calls, 1);
+    assert_eq!(key_calls, 0);
 }

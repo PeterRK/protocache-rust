@@ -14,6 +14,7 @@ pub struct PerfectHashView<'a> {
     bitmap: &'a [u8],
     table: &'a [u8],
     section: usize,
+    section_magic: u64,
     len: usize,
     table_width: usize,
 }
@@ -30,6 +31,7 @@ impl<'a> PerfectHashView<'a> {
                 bitmap: &data[..0],
                 table: &data[..0],
                 section: 0,
+                section_magic: 0,
                 len,
                 table_width: 0,
             });
@@ -51,6 +53,7 @@ impl<'a> PerfectHashView<'a> {
             bitmap,
             table,
             section,
+            section_magic: fast_mod_magic(section as u32),
             len,
             table_width,
         })
@@ -78,9 +81,9 @@ impl<'a> PerfectHashView<'a> {
         let seed = read_u32_le(self.data.get(4..8)?)? as u64;
         let code = hash128(key, seed);
         let slots = [
-            code[0] as usize % self.section,
-            code[1] as usize % self.section + self.section,
-            code[2] as usize % self.section + self.section * 2,
+            fast_mod_u32(code[0], self.section as u32, self.section_magic) as usize,
+            fast_mod_u32(code[1], self.section as u32, self.section_magic) as usize + self.section,
+            fast_mod_u32(code[2], self.section as u32, self.section_magic) as usize + self.section * 2,
         ];
         self.locate_slots(slots)
     }
@@ -149,21 +152,27 @@ fn bit2(vec: &[u8], pos: usize) -> Option<u32> {
 }
 
 #[inline(always)]
-fn count_valid_slot(mut v: u64) -> usize {
-    v &= v >> 1;
-    v = (v & 0x1111_1111_1111_1111) + ((v >> 2) & 0x1111_1111_1111_1111);
-    v += v >> 4;
-    v += v >> 8;
-    v = (v & 0x0f0f_0f0f_0f0f_0f0f) + ((v >> 16) & 0x0f0f_0f0f_0f0f_0f0f);
-    v += v >> 32;
-    32 - ((v & 0xff) as usize)
+fn fast_mod_magic(divisor: u32) -> u64 {
+    u64::MAX / divisor as u64 + 1
+}
+
+#[inline(always)]
+fn fast_mod_u32(value: u32, divisor: u32, magic: u64) -> u32 {
+    let low = magic.wrapping_mul(value as u64);
+    (((low as u128) * divisor as u128) >> 64) as u32
+}
+
+#[inline(always)]
+fn count_valid_slot(v: u64) -> usize {
+    let invalid = ((v & 0x5555_5555_5555_5555) & (v >> 1)).count_ones() as usize;
+    32 - invalid
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::{PerfectHashView, build_perfect_hash_index};
+    use super::{PerfectHashView, build_perfect_hash_index, fast_mod_magic, fast_mod_u32};
 
     fn run_case(size: usize) {
         let keys = (0..size).map(|i| i.to_string()).collect::<Vec<_>>();
@@ -212,6 +221,34 @@ mod tests {
         let index = build_perfect_hash_index(&["a", "b", "c"]).unwrap();
         for len in 0..index.len() {
             assert!(PerfectHashView::new(&index[..len]).is_err());
+        }
+    }
+
+    #[test]
+    fn fast_mod_matches_remainder() {
+        let divisors = [10u32, 11, 17, 31, 45, 255, 256, 1000, 65535, 100_000];
+        let values = [
+            0u32,
+            1,
+            2,
+            3,
+            7,
+            31,
+            32,
+            255,
+            256,
+            1024,
+            65_535,
+            1_000_000,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+
+        for divisor in divisors {
+            let magic = fast_mod_magic(divisor);
+            for value in values {
+                assert_eq!(fast_mod_u32(value, divisor, magic), value % divisor);
+            }
         }
     }
 }

@@ -642,3 +642,4 @@ impl<'a> MutableArrayElement<'a> for DeprecatedMutable<'a> {
         })
     }
 }
+
