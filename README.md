@@ -1,12 +1,29 @@
 # ProtoCache Rust
 
-Rust implementation of ProtoCache.
+Rust implementation of ProtoCache, including the core runtime, mutable APIs, schema/reflection extensions, and a `protoc` code generator for typed Rust bindings.
 
 > Warning
 >
-> This repository's Rust code is fully AI-generated.
-> The implementation, tests, generated APIs, and supporting glue in this workspace were produced by AI.
-> Verify behavior with tests before relying on it in production.
+> This Rust workspace was generated with AI assistance.
+> Treat it as generated software and verify behavior with tests and benchmarks before relying on it in production.
+
+## Overview
+
+The workspace is organized into four crates:
+
+| Crate | Purpose |
+|:--|:--|
+| `protocache-core` | Protobuf-free runtime for zero-copy reads, mutable access, encoding, hashing, compression, and perfect-hash utilities |
+| `protocache-extension` | Schema loading, descriptor handling, reflection, protobuf/prost bridging, and schema-aware helpers |
+| `protoc-gen-pcrs` | `protoc` plugin that generates typed Rust APIs |
+| `protocache-test` | Compatibility tests and the local benchmark harness |
+
+The primary Rust-facing API layers are:
+
+- `protocache_core::runtime` for zero-copy read access
+- `protocache_core::mutable` for mutable message, map, and array APIs
+- `protocache_core::encoding` for low-level buffer and encoding primitives
+- `protocache_extension::{reflection, utils}` for schema-aware and protobuf-facing workflows
 
 ## Benchmark
 
@@ -15,126 +32,59 @@ Using the local Rust harness in `protocache-test` on the bundled benchmark fixtu
 |  | Protobuf | ProtoCache | FlatBuffers |
 |:-------|----:|----:|----:|
 | Data Size | **574B** | 780B | 1296B |
-| Decode + Traverse + Dealloc | 2701ns | **294ns** | 466ns |
-| Decode + Traverse(reflection) + Dealloc | 14121ns | **652ns** | - |
+| Decode + Traverse + Dealloc | 2269ns | **260ns** | 321ns |
+| Decode + Traverse(reflection) + Dealloc | 12095ns | **550ns** | - |
 | Compressed Size | 566B | 571B | 856B |
-| Compress | 377ns | 688ns | 1235ns |
-| Decompress | 164ns | 395ns | 849ns |
+| Compress | 334ns | 548ns | 1000ns |
+| Decompress | 143ns | 321ns | 714ns |
 
 Mutable/serialize paths from the same Rust benchmark:
 
 | | Protobuf | ProtoCacheEX | ProtoCache |
 |:-------|----:|----:|----:|
-| Serialize | **1167ns** | 735 ~ 4110ns | 13917ns |
-| Decode + Traverse + Dealloc | 2701ns | 2195ns | **294ns** |
+| Serialize | **1003ns** | 418 ~ 2531ns | 10875ns |
+| Decode + Traverse + Dealloc | 2269ns | 2021ns | **260ns** |
 
-Run it with:
+## Build and Test
 
-```bash
-cargo run -p protocache-test --release
-```
-
-## Provenance
-
-This repository's Rust code is fully AI-generated.
-
-- The implementation, tests, and supporting glue in this workspace were produced by AI.
-- Treat the codebase as generated software: verify behavior with tests before relying on it in production.
-
-The Rust workspace uses the ProtoCache data format and keeps a clear API split between runtime, extension, and code generation layers:
-
-- zero-copy read-only runtime
-- extension APIs for schema reflection, `.proto` loading and protobuf/prost bridging
-- `protoc` code generator
-
-## Workspace
-
-`Cargo.toml` contains these crates:
-
-| Crate | Purpose |
-|:--|:--|
-| `protocache-core` | Protobuf-free core runtime for reading, writing, hashing, compression and mutable primitives |
-| `protocache-extension` | Extension APIs for `.proto` parsing, descriptor loading, reflection, protobuf/prost bridging and schema-aware mutable APIs |
-| `protoc-gen-pcrs` | Rust code generator for typed APIs |
-| `protocache-test` | Local performance harness and test umbrella |
-
-## Dependency Boundary
-
-The Rust implementation does not depend on any non-Rust source tree at build or runtime.
-
-- Rust crates only depend on other Rust crates in this workspace and published Rust dependencies.
-- Tests and local performance tooling may reuse fixture data, but that is data reuse, not code dependency.
-
-Some workflows still rely on external tools:
-
-- `protoc` is used for `.proto` parsing and code generation related flows.
-- `flatc` is used only by the local performance harness.
-
-## Usage
-
-Run workspace tests:
+Run the full workspace test suite:
 
 ```bash
 cargo test --workspace
 ```
 
-Generate Rust typed APIs with the plugin:
+Build the benchmark harness:
+
+```bash
+cargo build --release -p protocache-test
+```
+
+## Code Generation
+
+Generate typed Rust APIs with the plugin:
 
 ```bash
 cargo run -p protoc-gen-pcrs -- < input.bin > output.bin
 ```
 
+## Dependency Boundary
 
-### API Layers
+The Rust implementation does not depend on any non-Rust source tree at build or runtime.
 
-The Rust API surface is grouped into a small set of layers.
+- Rust crates depend only on workspace crates and published Rust dependencies.
+- Fixture reuse in tests and benchmarks is data reuse, not a runtime code dependency.
 
-Core runtime APIs:
+Some developer workflows still rely on external tools:
 
-- `protocache_core::runtime`: zero-copy read-only access to protocache data
-- `protocache_core::mutable`: mutable APIs such as `MutableMessage`, `MutableMap`, and `MutableArray`
-- `protocache_core::encoding`: low-level encoding primitives and `Buffer`
-
-Support APIs:
-
-- `protocache_extension::utils`: `.proto` loading, JSON helpers, and protobuf/prost -> protocache conversion
-- `protocache_extension::reflection`: schema reflection support
-
-Error model:
-
-- protobuf/prost bridge operations use `protocache_core::MutableError`
-- JSON helpers use `protocache_extension::utils::JsonError`
-
-Primary entry points:
-
-- `protocache_core::access`, `protocache_core::serialize`, `protocache_core::perfect_hash`
-- `protocache_core::mutable`
-- `protocache_extension::{reflection, utils}`
-
-### Recommended Usage
-
-Prefer these APIs for long-term integration:
-
-- for zero-copy reads, start from `protocache_core::runtime::MessageView`
-- for mutable writes, prefer `protocache_core::mutable::MutableMessage`
-- for extension-side conversion flows, prefer `protocache_extension::utils::serialize`
+- `protoc` for `.proto` parsing and code generation flows
+- `flatc` for the local benchmark harness
 
 ## Notes
 
-The Rust side follows the same two-layer split across this workspace:
+For most integrations:
 
-- depend on `protocache-core` for the protobuf-free runtime and mutable primitives
-- add `protocache-extension` when you need `extension/*` capabilities such as `.proto` parsing, descriptor handling, reflection, or protobuf/prost bridging
+- start read-only access from `protocache_core::runtime::MessageView`
+- use `protocache_core::mutable` for mutable document workflows
+- add `protocache-extension` only when you need schema loading, reflection, or protobuf/prost conversion
 
-The main runtime surface should be read as:
-
-- `protocache_core::{runtime, mutable, encoding}` are the primary Rust-first public APIs
-- `protocache_core::{access, mutable, serialize, perfect_hash}` are the primary top-level modules
-- `protocache_extension::{reflection, utils}` are the primary extension-side public APIs
-
-Most users should not need to work with `DynamicMessage`, `ReflectMessage`, or descriptor wiring directly.
-
-The current state is:
-
-- functionality is covered by workspace tests and compatibility checks
-- some serialization and reflection-heavy paths still need optimization work
+Most users should not need to work with descriptor wiring or dynamic reflection types directly unless they are building schema-driven tooling.

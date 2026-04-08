@@ -463,12 +463,14 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
     }
 }
 
+#[inline(always)]
 fn detect_array_words<'a, T: MutableField<'a>>(words: &'a [u32]) -> Option<&'a [u32]> {
     let array = ArrayView::new(words)?;
-    let end = ArrayView::detect_len(words)?;
+    let end = array.total_words();
+    let base_end = unsafe { words.as_ptr().add(end) };
     for index in (0..array.len()).rev() {
-        let detected = T::detect(array.field(index)?)?;
-        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+        let detected = T::detect(array.expect_field(index))?;
+        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
             let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
             return words.get(..offset.checked_add(detected.len())?);
         }
@@ -476,19 +478,21 @@ fn detect_array_words<'a, T: MutableField<'a>>(words: &'a [u32]) -> Option<&'a [
     words.get(..end)
 }
 
+#[inline(always)]
 fn detect_map_words<'a, K: MutableMapKey<'a>, V: MutableField<'a>>(words: &'a [u32]) -> Option<&'a [u32]> {
     let map = MapView::new(words)?;
-    let end = MapView::detect_len(words)?;
+    let end = map.total_words();
+    let base_end = unsafe { words.as_ptr().add(end) };
     for index in (0..map.len()).rev() {
-        let pair = map.pair(index)?;
+        let pair = map.expect_pair(index);
         let detected = V::detect(pair.value())?;
-        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
             let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
             return words.get(..offset.checked_add(detected.len())?);
         }
 
         let detected = K::detect_key(pair.key())?;
-        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
             let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
             return words.get(..offset.checked_add(detected.len())?);
         }
@@ -526,16 +530,19 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
         })
     }
 
+    #[inline(always)]
     fn field(&self, id: usize) -> Option<FieldView<'a>> {
         let words = self.words?;
         let layout = MessageView::layout(words)?;
         MessageView::field_in(words, &layout, id)
     }
 
+    #[inline(always)]
     pub fn has_field(&self, id: usize) -> bool {
         self.field(id).is_some()
     }
 
+    #[inline(always)]
     pub fn was_accessed(&self, id: usize) -> bool {
         let word = id / 64;
         let bit = id % 64;
@@ -567,6 +574,7 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
         slot
     }
 
+    #[inline(always)]
     pub fn serialize_field<T: MutableField<'a>>(
         &self,
         id: usize,
@@ -614,6 +622,7 @@ fn drop_present_unit(buffer: &mut Buffer, unit: &mut Unit) {
     *unit = Unit::empty();
 }
 
+#[inline(always)]
 pub fn copy_words(words: &[u32], buffer: &mut Buffer, fold: bool) -> Unit {
     if fold && words.len() < 4 {
         return Unit::inline(words);
@@ -899,6 +908,7 @@ impl<'a, T: MutableArrayElement<'a>> MutableField<'a> for MutableArray<'a, T> {
         Self::from_words(field.object_words()?)
     }
 
+    #[inline(always)]
     fn detect(field: FieldView<'a>) -> Option<&'a [u32]> {
         Self::detect_array_field(field)
     }
@@ -932,6 +942,7 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableField<'a> for Mutable
         Self::from_words(field.object_words()?)
     }
 
+    #[inline(always)]
     fn detect(field: FieldView<'a>) -> Option<&'a [u32]> {
         detect_map_words::<K, V>(field.object_words()?)
     }
@@ -970,6 +981,7 @@ impl<'a, T: MutableArrayElement<'a>> MutableArrayElement<'a> for MutableArray<'a
         Some(values)
     }
 
+    #[inline(always)]
     fn detect_array_field(field: FieldView<'a>) -> Option<&'a [u32]> {
         field
             .object_words()
@@ -1002,18 +1014,22 @@ impl<'a, T: MutableField<'a>> MutableField<'a> for Box<T> {
         Some(Box::new(T::decode(field)?))
     }
 
+    #[inline(always)]
     fn detect(field: FieldView<'a>) -> Option<&'a [u32]> {
         T::detect(field)
     }
 
+    #[inline(always)]
     fn encode(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
         self.as_ref().encode(buffer)
     }
 
+    #[inline(always)]
     fn is_dirty(&self) -> bool {
         self.as_ref().is_dirty()
     }
 
+    #[inline(always)]
     fn has_nested_dirty(&self) -> bool {
         self.as_ref().has_nested_dirty()
     }

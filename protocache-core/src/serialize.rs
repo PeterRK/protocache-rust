@@ -588,7 +588,7 @@ pub fn serialize_bytes(bytes: &[u8], buffer: &mut Buffer) -> Option<Unit> {
         })
     } else {
         let words = buffer.expand(total_words);
-        words.fill(0);
+        words[total_words - 1] = 0;
         let raw = unsafe {
             core::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), total_words * 4)
         };

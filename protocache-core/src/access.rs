@@ -499,6 +499,11 @@ impl<'a> ArrayView<'a> {
     }
 
     #[inline(always)]
+    pub(crate) fn total_words(self) -> usize {
+        1 + self.len * self.width
+    }
+
+    #[inline(always)]
     pub fn field(self, index: usize) -> Option<FieldView<'a>> {
         if index >= self.len {
             return None;
@@ -751,6 +756,7 @@ pub struct MapView<'a> {
     len: usize,
     key_width: usize,
     value_width: usize,
+    total_words: usize,
 }
 
 impl<'a> MapView<'a> {
@@ -766,13 +772,15 @@ impl<'a> MapView<'a> {
         let index = PerfectHashView::new(bytes_of_words(words)).ok()?;
         let body_offset = word_size(index.data_size());
         let body = words.get(body_offset..)?;
-        body.get(..index.len().checked_mul(key_width + value_width)?)?;
+        let pair_words = index.len().checked_mul(key_width + value_width)?;
+        body.get(..pair_words)?;
         Some(Self {
             index,
             body,
             len: index.len(),
             key_width,
             value_width,
+            total_words: body_offset.checked_add(pair_words)?,
         })
     }
 
@@ -804,6 +812,11 @@ impl<'a> MapView<'a> {
     }
 
     #[inline(always)]
+    pub(crate) fn total_words(self) -> usize {
+        self.total_words
+    }
+
+    #[inline(always)]
     pub fn pair(self, index: usize) -> Option<PairView<'a>> {
         if index >= self.len {
             return None;
@@ -815,6 +828,17 @@ impl<'a> MapView<'a> {
             key_width: self.key_width,
             value_width: self.value_width,
         })
+    }
+
+    #[inline(always)]
+    pub fn expect_pair(self, index: usize) -> PairView<'a> {
+        let width = self.key_width + self.value_width;
+        let start = index * width;
+        PairView {
+            tail: &self.body[start..],
+            key_width: self.key_width,
+            value_width: self.value_width,
+        }
     }
 
 
@@ -1059,10 +1083,11 @@ pub fn detect_array_with<'a>(
     mut detect: impl FnMut(FieldView<'a>) -> Option<&'a [u32]>,
 ) -> Option<&'a [u32]> {
     let array = ArrayView::new(words)?;
-    let end = ArrayView::detect_len(words)?;
+    let end = array.total_words();
+    let base_end = unsafe { words.as_ptr().add(end) };
     for index in (0..array.len()).rev() {
-        let detected = detect(array.field(index)?)?;
-        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+        let detected = detect(array.expect_field(index))?;
+        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
             let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
             return words.get(..offset.checked_add(detected.len())?);
         }
@@ -1077,17 +1102,18 @@ pub fn detect_map_with<'a>(
     mut detect_value: impl FnMut(FieldView<'a>) -> Option<&'a [u32]>,
 ) -> Option<&'a [u32]> {
     let map = MapView::new(words)?;
-    let end = MapView::detect_len(words)?;
+    let end = map.total_words();
+    let base_end = unsafe { words.as_ptr().add(end) };
     for index in (0..map.len()).rev() {
-        let pair = map.pair(index)?;
+        let pair = map.expect_pair(index);
         let detected = detect_value(pair.value())?;
-        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
             let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
             return words.get(..offset.checked_add(detected.len())?);
         }
 
         let detected = detect_key(pair.key())?;
-        if detected.as_ptr_range().end > words[..end].as_ptr_range().end {
+        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
             let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
             return words.get(..offset.checked_add(detected.len())?);
         }

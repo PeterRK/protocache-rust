@@ -195,7 +195,9 @@ impl Buffer {
             self.grow(needed);
         }
         self.off -= delta;
-        &mut self.data[self.off..self.off + delta]
+        let ptr = unsafe { self.data.as_mut_ptr().add(self.off) };
+        // `off + delta` is within `data` because we either had capacity or just grew.
+        unsafe { core::slice::from_raw_parts_mut(ptr, delta) }
     }
 
     #[inline(always)]
@@ -211,7 +213,9 @@ impl Buffer {
 
     #[inline(always)]
     pub fn put_words(&mut self, words: &[u32]) {
-        self.expand(words.len()).copy_from_slice(words);
+        let dst = self.expand(words.len());
+        // `expand` returned a non-overlapping destination slice with the exact length.
+        unsafe { core::ptr::copy_nonoverlapping(words.as_ptr(), dst.as_mut_ptr(), words.len()) };
     }
 
     #[inline(always)]
