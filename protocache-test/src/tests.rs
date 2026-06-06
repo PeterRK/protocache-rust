@@ -183,6 +183,7 @@ fn generated_fully_materialized_serialization_matches_fixture() {
 fn benchmark_fixtures_match_expected_access_hashes() {
     let protobuf_raw = load_fixture_bytes("test.pb");
     let flatbuffers_raw = load_fixture_bytes("test.fb");
+    let fory_raw = load_fixture_bytes("test.fr");
     let protocache_raw = load_fixture_bytes("test.pc");
     let protocache_words = bytes_to_words(&protocache_raw);
 
@@ -194,10 +195,16 @@ fn benchmark_fixtures_match_expected_access_hashes() {
     let mut fb_junk = Junk::default();
     traverse_fb_main(fb, &mut fb_junk);
 
+    let fory = new_fory().unwrap();
+    let fory_root: fory_generated::Main = fory.deserialize(&fory_raw).unwrap();
+    let mut fory_junk = Junk::default();
+    traverse_fory_main(&fory_root, &mut fory_junk);
+
     let pc = MessageView::new(&protocache_words).unwrap();
     let mut pc_junk = Junk::default();
     traverse_pc_main(pc, &mut pc_junk).unwrap();
     assert_eq!(pb_junk.fuse(), fb_junk.fuse());
+    assert_eq!(pb_junk.fuse(), fory_junk.fuse());
     assert_eq!(pb_junk.fuse(), pc_junk.fuse());
 
     let reflect_pool = load_reflect_descriptor_pool_from_proto_file(&fixture_root().join("proto/test.proto")).unwrap();
@@ -280,6 +287,26 @@ fn benchmark_generated_ex_matches_cpp_basic_expectations() {
 }
 
 #[test]
+fn benchmark_fory_generated_view_matches_cpp_basic_expectations() {
+    let fory = new_fory().unwrap();
+    let raw = load_fixture_bytes("test.fr");
+    let root: fory_generated::Main = fory.deserialize(&raw).unwrap();
+
+    assert_eq!(root.i32, -999);
+    assert_eq!(root.u32, 1234);
+    assert_eq!(root.i64, -9_876_543_210);
+    assert_eq!(root.u64, 98_765_432_123_456_789);
+    assert!(root.flag);
+    assert_eq!(root.mode, fory_generated::Mode::C);
+    assert_eq!(root.str, "Hello World!");
+    assert_eq!(root.data.as_slice(), b"abc123!?$*&()'-=@~");
+    assert_eq!(root.object.as_ref().unwrap().i32, 88);
+    assert_eq!(root.objectv.len(), 3);
+    assert_eq!(root.matrix.as_ref().unwrap().x[2].x[2], 9.0);
+    assert_eq!(root.arrays.as_ref().unwrap().x["lv5"].x, [51.0, 52.0]);
+}
+
+#[test]
 fn benchmark_generated_ex_serialize_mutation_regression() {
     let words = load_fixture_words();
     let mut root = pcrs_generated::MainMutable::FromWords(&words).unwrap();
@@ -336,7 +363,7 @@ fn benchmark_generated_ex_serialize_mutation_regression() {
 
 #[test]
 fn benchmark_compress_roundtrip_regression() {
-    for name in ["test.pb", "test.pc", "test.fb"] {
+    for name in ["test.pb", "test.pc", "test.fb", "test.fr"] {
         let raw = load_fixture_bytes(name);
         let mut compressed = Vec::new();
         compress_into(&raw, &mut compressed);

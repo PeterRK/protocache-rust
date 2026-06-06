@@ -25,6 +25,9 @@ fn main() {
     let flatc = env::var_os("FLATC")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("flatc"));
+    let foryc = env::var_os("FORYC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("foryc"));
     let protoc_gen_pcrs = env::var_os("PROTOC_GEN_PCRS")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("protoc-gen-pcrs"));
@@ -41,6 +44,10 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        fixture_root.join("benchmark/test.fdl").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         checked_in_pcrs_generated_path.display()
     );
     println!(
@@ -50,6 +57,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PROTOC_GEN_PCRS");
     println!("cargo:rerun-if-env-changed=PROTOC_GEN_PCRS_PARAMETER");
     println!("cargo:rerun-if-env-changed=FLATC");
+    println!("cargo:rerun-if-env-changed=FORYC");
 
     let prost_proto = out_dir.join("test-prost.proto");
     let pcrs_proto = out_dir.join("test-pcrs.proto");
@@ -131,6 +139,16 @@ fn main() {
     let mut generated = fs::read_to_string(&generated_path).unwrap();
     rewrite_flatbuffers_generated_identifiers(&mut generated);
     fs::write(generated_path, generated).unwrap();
+
+    let status = Command::new(&foryc)
+        .arg(fixture_root.join("benchmark/test.fdl"))
+        .arg("--rust_out")
+        .arg(&out_dir)
+        .status()
+        .unwrap_or_else(|err| panic!("failed to launch foryc {:?}: {err}", foryc));
+    if !status.success() {
+        panic!("foryc {:?} failed with status {status}", foryc);
+    }
 }
 
 fn generate_with_protoc_gen_pcrs(

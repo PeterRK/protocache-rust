@@ -49,6 +49,18 @@ mod fb_generated {
     clippy::nursery,
     warnings
 )]
+mod fory_generated {
+    include!(concat!(env!("OUT_DIR"), "/test_fory.rs"));
+}
+
+#[allow(
+    dead_code,
+    unused_imports,
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    warnings
+)]
 mod pcrs_generated {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test.pc.rs"));
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test.pc-ex.rs"));
@@ -66,6 +78,7 @@ enum BenchError {
     Decode(prost::DecodeError),
     Proto(ProtoError),
     ReflectDescriptor(ReflectDescriptorError),
+    Fory(fory::Error),
     Mutable(MutableError),
     Read(ReadError),
 }
@@ -106,6 +119,12 @@ impl From<ReflectDescriptorError> for BenchError {
     }
 }
 
+impl From<fory::Error> for BenchError {
+    fn from(value: fory::Error) -> Self {
+        Self::Fory(value)
+    }
+}
+
 impl From<MutableError> for BenchError {
     fn from(value: MutableError) -> Self {
         Self::Mutable(value)
@@ -127,6 +146,7 @@ impl std::fmt::Display for BenchError {
             Self::Decode(err) => err.fmt(f),
             Self::Proto(err) => err.fmt(f),
             Self::ReflectDescriptor(err) => err.fmt(f),
+            Self::Fory(err) => err.fmt(f),
             Self::Mutable(err) => err.fmt(f),
             Self::Read(err) => err.fmt(f),
         }
@@ -263,6 +283,7 @@ fn main() -> BenchResult<()> {
 
     let protobuf_raw = fs::read(fixture_dir.join("test.pb"))?;
     let flatbuffers_raw = fs::read(fixture_dir.join("test.fb"))?;
+    let fory_raw = fs::read(fixture_dir.join("test.fr"))?;
     let protocache_raw = fs::read(fixture_dir.join("test.pc"))?;
     let protocache_words = bytes_to_words(&protocache_raw);
     let protocache_dynamic = load_benchmark_dynamic_message(&protobuf_raw, &schema_path)?;
@@ -272,6 +293,9 @@ fn main() -> BenchResult<()> {
     }
     if config.should_run("flatbuffers") {
         benchmark_flatbuffers(&flatbuffers_raw, config.loops)?;
+    }
+    if config.should_run("fory") {
+        benchmark_fory(&fory_raw, config.loops)?;
     }
     if config.should_run("protocache") {
         benchmark_protocache(&protocache_words, &protocache_raw, config.loops)?;
@@ -311,6 +335,7 @@ fn main() -> BenchResult<()> {
         || config.should_run("pb-compress")
         || config.should_run("pc-compress")
         || config.should_run("fb-compress")
+        || config.should_run("fr-compress")
     {
         println!("========compress========");
     }
@@ -322,6 +347,9 @@ fn main() -> BenchResult<()> {
     }
     if config.should_run("fb-compress") {
         benchmark_compress("fb", &flatbuffers_raw, config.loops)?;
+    }
+    if config.should_run("fr-compress") {
+        benchmark_compress("fr", &fory_raw, config.loops)?;
     }
     Ok(())
 }
@@ -423,6 +451,28 @@ fn benchmark_flatbuffers(raw: &[u8], loops: usize) -> BenchResult<()> {
         traverse_fb_main(root, &mut junk);
     }
     print_access_result("flatbuffers", raw.len(), start.elapsed(), loops, junk.fuse());
+    Ok(())
+}
+
+fn new_fory() -> BenchResult<fory::Fory> {
+    let mut fory = fory::Fory::builder()
+        .xlang(true)
+        .track_ref(true)
+        .compatible(true)
+        .build();
+    fory_generated::register_types(&mut fory)?;
+    Ok(fory)
+}
+
+fn benchmark_fory(raw: &[u8], loops: usize) -> BenchResult<()> {
+    let fory = new_fory()?;
+    let mut junk = Junk::default();
+    let start = Instant::now();
+    for _ in 0..loops {
+        let root: fory_generated::Main = fory.deserialize(raw)?;
+        traverse_fory_main(&root, &mut junk);
+    }
+    print_access_result("fory", raw.len(), start.elapsed(), loops, junk.fuse());
     Ok(())
 }
 
@@ -833,6 +883,108 @@ fn traverse_pb_main(root: &pb::Main, junk: &mut Junk) {
     }
     if let Some(arrays) = root.arrays.as_ref() {
         traverse_pb_arr_map(arrays, junk);
+    }
+}
+
+fn traverse_fory_small(root: &fory_generated::Small, junk: &mut Junk) {
+    junk.u32_sum = junk
+        .u32_sum
+        .wrapping_add(root.i32 as u32)
+        .wrapping_add(u32::from(root.flag));
+    junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(root.str.as_bytes()));
+}
+
+fn traverse_fory_vec2d(root: &fory_generated::Vec2D, junk: &mut Junk) {
+    for row in &root.x {
+        for value in &row.x {
+            junk.add_f32(*value);
+        }
+    }
+}
+
+fn traverse_fory_arr_map(root: &fory_generated::ArrMap, junk: &mut Junk) {
+    for (key, value) in &root.x {
+        junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(key.as_bytes()));
+        for item in &value.x {
+            junk.add_f32(*item);
+        }
+    }
+}
+
+fn traverse_fory_main(root: &fory_generated::Main, junk: &mut Junk) {
+    junk.u32_sum = junk
+        .u32_sum
+        .wrapping_add(root.i32 as u32)
+        .wrapping_add(root.u32)
+        .wrapping_add(u32::from(root.flag))
+        .wrapping_add(root.mode.clone() as u32);
+    junk.u32_sum = junk
+        .u32_sum
+        .wrapping_add(root.t_i32 as u32)
+        .wrapping_add(root.t_s32 as u32)
+        .wrapping_add(root.t_u32);
+    for value in &root.i32v {
+        junk.u32_sum = junk.u32_sum.wrapping_add(*value as u32);
+    }
+    for value in &root.flags {
+        junk.u32_sum = junk.u32_sum.wrapping_add(u32::from(*value));
+    }
+    junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(root.str.as_bytes()));
+    junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(&root.data));
+    for value in &root.strv {
+        junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(value.as_bytes()));
+    }
+    for value in &root.datav {
+        junk.u32_sum = junk.u32_sum.wrapping_add(junk_hash_bytes(value));
+    }
+
+    junk.u64_sum = junk
+        .u64_sum
+        .wrapping_add(root.i64 as u64)
+        .wrapping_add(root.u64)
+        .wrapping_add(root.t_i64 as u64)
+        .wrapping_add(root.t_s64 as u64)
+        .wrapping_add(root.t_u64);
+    for value in &root.u64v {
+        junk.u64_sum = junk.u64_sum.wrapping_add(*value);
+    }
+
+    junk.add_f32(root.f32);
+    for value in &root.f32v {
+        junk.add_f32(*value);
+    }
+
+    junk.add_f64(root.f64);
+    for value in &root.f64v {
+        junk.add_f64(*value);
+    }
+
+    if let Some(object) = root.object.as_ref() {
+        traverse_fory_small(object, junk);
+    }
+    for value in &root.objectv {
+        traverse_fory_small(value, junk);
+    }
+
+    for (key, value) in &root.index {
+        junk.u32_sum = junk
+            .u32_sum
+            .wrapping_add(junk_hash_bytes(key.as_bytes()))
+            .wrapping_add(*value as u32);
+    }
+    for (key, value) in &root.objects {
+        junk.u32_sum = junk.u32_sum.wrapping_add(*key as u32);
+        traverse_fory_small(value, junk);
+    }
+
+    if let Some(matrix) = root.matrix.as_ref() {
+        traverse_fory_vec2d(matrix, junk);
+    }
+    for value in &root.vector {
+        traverse_fory_arr_map(value, junk);
+    }
+    if let Some(arrays) = root.arrays.as_ref() {
+        traverse_fory_arr_map(arrays, junk);
     }
 }
 

@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 flatbuffers = "=2.1.2"
+fory = "=1.0.0"
+fory-core = "=1.0.0"
+fory-derive = "=1.0.0"
 mimalloc = { version = "0.1", default-features = false }
 prost = "0.13.5"
 prost-reflect = "0.15.0"

@@ -27,23 +27,24 @@ The primary Rust-facing API layers are:
 
 ## Benchmark
 
-Using the local Rust harness in `protocache-test` on the bundled benchmark fixture:
+Using the local Rust harness in `protocache-test` on the bundled benchmark fixture
+with `--loops 1000000`. Timings are ns/op-equivalent local samples.
 
-|  | Protobuf | ProtoCache | FlatBuffers |
-|:-------|----:|----:|----:|
-| Data Size | **574B** | 780B | 1296B |
-| Decode + Traverse + Dealloc | 2269ns | **260ns** | 321ns |
-| Decode + Traverse(reflection) + Dealloc | 12095ns | **550ns** | - |
-| Compressed Size | 566B | 571B | 856B |
-| Compress | 334ns | 548ns | 1000ns |
-| Decompress | 143ns | 321ns | 714ns |
+|  | Protobuf | ProtoCache | FlatBuffers | Fory |
+|:-------|----:|----:|----:|----:|
+| Data Size | **574B** | 780B | 1296B | 615B |
+| Decode + Traverse + Dealloc | 1825ns | **219ns** | 265ns | 1347ns |
+| Decode + Traverse(reflection) + Dealloc | 9628ns | **432ns** | - | - |
+| Compressed Size | **566B** | 571B | 856B | 611B |
+| Compress | **273ns** | 436ns | 817ns | 315ns |
+| Decompress | **117ns** | 271ns | 600ns | 154ns |
 
 Mutable/serialize paths from the same Rust benchmark:
 
 | | Protobuf | ProtoCacheEX | ProtoCache |
 |:-------|----:|----:|----:|
-| Serialize | **1003ns** | 418 ~ 2531ns | 10875ns |
-| Decode + Traverse + Dealloc | 2269ns | 2021ns | **260ns** |
+| Serialize | 800ns | 355ns / 2381ns | 8679ns |
+| Decode + Traverse + Dealloc | 1825ns | 1615ns | 219ns |
 
 ## Build and Test
 
