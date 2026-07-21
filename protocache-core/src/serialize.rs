@@ -2,8 +2,8 @@
 
 pub use crate::Buffer;
 
-use crate::hash::hash128;
 use crate::Scalar;
+use crate::hash::hash128;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Segment {
@@ -243,7 +243,10 @@ fn best_array_size_pairs(elements: &[(Unit, Unit)]) -> ((usize, usize), (usize, 
         }
     }
 
-    ((key_sizes[key_mode], key_mode + 1), (value_sizes[value_mode], value_mode + 1))
+    (
+        (key_sizes[key_mode], key_mode + 1),
+        (value_sizes[value_mode], value_mode + 1),
+    )
 }
 
 #[inline(always)]
@@ -364,7 +367,11 @@ fn peel_graph(edges: &[Edge], slot_cnt: usize) -> Option<Vec<usize>> {
 #[inline(always)]
 fn count_valid_slots(bitmap: &[u8], block: usize) -> usize {
     let start = block * 8;
-    let bits = u64::from_le_bytes(bitmap[start..start + 8].try_into().expect("bitmap block must fit"));
+    let bits = u64::from_le_bytes(
+        bitmap[start..start + 8]
+            .try_into()
+            .expect("bitmap block must fit"),
+    );
     count_valid_slots_in_word(bits)
 }
 
@@ -551,7 +558,9 @@ pub fn fold_field(buffer: &mut Buffer, unit: &mut Unit) {
 pub fn serialize_scalar<T: Scalar>(value: T) -> Unit {
     let mut words = [0u32; 3];
     let word_len = T::WIDTH;
-    value.write_words(&mut words[..word_len]).expect("scalar width must match");
+    value
+        .write_words(&mut words[..word_len])
+        .expect("scalar width must match");
     Unit {
         inline_len: word_len,
         inline_data: words,
@@ -697,7 +706,11 @@ pub fn serialize_message(fields: &mut [Unit], buffer: &mut Buffer) -> Option<Uni
 }
 
 #[inline(always)]
-pub fn serialize_array_at_mut(elements: &mut [Unit], buffer: &mut Buffer, last: usize) -> Option<Unit> {
+pub fn serialize_array_at_mut(
+    elements: &mut [Unit],
+    buffer: &mut Buffer,
+    last: usize,
+) -> Option<Unit> {
     if elements.is_empty() {
         return Some(Unit::inline(&[1]));
     }
@@ -793,7 +806,8 @@ pub fn serialize_map_at_mut(
 
     let head = buffer.expand(index_words);
     head.fill(0);
-    let raw = unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
+    let raw =
+        unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
     raw[..index.len()].copy_from_slice(index);
     head[0] |= (key_width as u32) << 30 | (value_width as u32) << 28;
     Some(Unit::segment(last, buffer.len()))
@@ -830,7 +844,8 @@ pub(crate) fn serialize_map_pairs_at_mut(
 
     let head = buffer.expand(index_words);
     head.fill(0);
-    let raw = unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
+    let raw =
+        unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
     raw[..index.len()].copy_from_slice(index);
     head[0] |= (key_width as u32) << 30 | (value_width as u32) << 28;
     Some(Unit::segment(last, buffer.len()))
@@ -867,7 +882,8 @@ pub fn serialize_map_at(
         let key_words = unit_words(&keys[index], buffer)?;
         let value_words = unit_words(&values[index], buffer)?;
         let cell_start = index.checked_mul(pair_width)?;
-        let (key_cell, value_cell) = cells[cell_start..cell_start + pair_width].split_at_mut(key_width);
+        let (key_cell, value_cell) =
+            cells[cell_start..cell_start + pair_width].split_at_mut(key_width);
 
         if key_words.len() <= key_width {
             key_cell[..key_words.len()].copy_from_slice(key_words);
@@ -892,14 +908,20 @@ pub fn serialize_map_at(
 
     let head = buffer.expand(index_words);
     head.fill(0);
-    let raw = unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
+    let raw =
+        unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
     raw[..index.len()].copy_from_slice(index);
     head[0] |= (key_width as u32) << 30 | (value_width as u32) << 28;
     Some(Unit::segment(last, buffer.len()))
 }
 
 #[inline(always)]
-pub fn serialize_map(index: &[u8], keys: &[Unit], values: &[Unit], buffer: &mut Buffer) -> Option<Unit> {
+pub fn serialize_map(
+    index: &[u8],
+    keys: &[Unit],
+    values: &[Unit],
+    buffer: &mut Buffer,
+) -> Option<Unit> {
     serialize_map_at(index, keys, values, buffer, buffer.len())
 }
 
@@ -907,8 +929,8 @@ pub fn serialize_map(index: &[u8], keys: &[Unit], values: &[Unit], buffer: &mut 
 mod tests {
     use super::{
         Unit, build_perfect_hash_index, build_perfect_hash_index_with_positions, fold_field,
-        serialize_array, serialize_array_at, serialize_bool, serialize_map, serialize_message, serialize_scalar,
-        serialize_str,
+        serialize_array, serialize_array_at, serialize_bool, serialize_map, serialize_message,
+        serialize_scalar, serialize_str,
     };
     use crate::{ArrayView, Buffer, MapView, MessageView, StringView, ViewArray};
 
@@ -1002,8 +1024,14 @@ mod tests {
         let _map = serialize_map(&index, &keys, &values, &mut buffer).unwrap();
 
         let view = MapView::new(buffer.view()).unwrap();
-        assert_eq!(view.find_str("abc-1").unwrap().value().scalar::<i32>(), Some(1));
-        assert_eq!(view.find_str("abc-2").unwrap().value().scalar::<i32>(), Some(2));
+        assert_eq!(
+            view.find_str("abc-1").unwrap().value().scalar::<i32>(),
+            Some(1)
+        );
+        assert_eq!(
+            view.find_str("abc-2").unwrap().value().scalar::<i32>(),
+            Some(2)
+        );
         assert!(view.find_str("abc-3").is_none());
     }
 
@@ -1056,15 +1084,24 @@ mod tests {
 
         let view = MapView::new(buffer.view()).unwrap();
         let lv5 = view.find_str("lv5").unwrap().value().array().unwrap();
-        assert_eq!(lv5.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(), vec![51.0, 52.0, 53.0]);
+        assert_eq!(
+            lv5.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
+            vec![51.0, 52.0, 53.0]
+        );
         let lv9 = view.find_str("lv9").unwrap().value().array().unwrap();
-        assert_eq!(lv9.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(), vec![91.0, 92.0]);
+        assert_eq!(
+            lv9.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
+            vec![91.0, 92.0]
+        );
     }
 
     #[test]
     fn serializes_multi_entry_short_string_key_float_array_map_roundtrip() {
         let keys = ["lv1", "lv2", "lv3", "lv4", "lv5", "lv9"];
-        let key_bytes = keys.iter().map(|key| key.as_bytes().to_vec()).collect::<Vec<_>>();
+        let key_bytes = keys
+            .iter()
+            .map(|key| key.as_bytes().to_vec())
+            .collect::<Vec<_>>();
         let (index, positions) = build_perfect_hash_index_with_positions(&key_bytes).unwrap();
 
         let values_src = [

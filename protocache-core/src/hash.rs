@@ -112,20 +112,18 @@ pub fn hash128(msg: &[u8], seed: u64) -> [u32; 4] {
 
     let tail = &msg[offset..];
     d = d.wrapping_add((msg.len() as u64) << 56);
-    match tail.len() & 0xf {
-        15 => d = d.wrapping_add((tail[14] as u64) << 48),
-        _ => {}
+    if tail.len() & 0xf == 15 {
+        d = d.wrapping_add((tail[14] as u64) << 48);
     }
     match tail.len() & 0xf {
         15 | 14 => d = d.wrapping_add((tail[13] as u64) << 40),
         _ => {}
     }
-    match tail.len() & 0xf {
-        15 | 14 | 13 => d = d.wrapping_add((tail[12] as u64) << 32),
-        _ => {}
+    if let 13..=15 = tail.len() & 0xf {
+        d = d.wrapping_add((tail[12] as u64) << 32);
     }
     match tail.len() & 0xf {
-        15 | 14 | 13 | 12 => {
+        12..=15 => {
             d = d.wrapping_add(u32::from_le_bytes(tail[8..12].try_into().unwrap()) as u64);
             c = c.wrapping_add(read_u64_le(tail).unwrap());
         }
@@ -136,12 +134,11 @@ pub fn hash128(msg: &[u8], seed: u64) -> [u32; 4] {
         11 | 10 => d = d.wrapping_add((tail[9] as u64) << 8),
         _ => {}
     }
-    match tail.len() & 0xf {
-        11 | 10 | 9 => d = d.wrapping_add(tail[8] as u64),
-        _ => {}
+    if let 9..=11 = tail.len() & 0xf {
+        d = d.wrapping_add(tail[8] as u64);
     }
     match tail.len() & 0xf {
-        11 | 10 | 9 | 8 => c = c.wrapping_add(read_u64_le(tail).unwrap()),
+        8..=11 => c = c.wrapping_add(read_u64_le(tail).unwrap()),
         7 => c = c.wrapping_add((tail[6] as u64) << 48),
         _ => {}
     }
@@ -149,14 +146,11 @@ pub fn hash128(msg: &[u8], seed: u64) -> [u32; 4] {
         7 | 6 => c = c.wrapping_add((tail[5] as u64) << 40),
         _ => {}
     }
-    match tail.len() & 0xf {
-        7 | 6 | 5 => c = c.wrapping_add((tail[4] as u64) << 32),
-        _ => {}
+    if let 5..=7 = tail.len() & 0xf {
+        c = c.wrapping_add((tail[4] as u64) << 32);
     }
     match tail.len() & 0xf {
-        7 | 6 | 5 | 4 => {
-            c = c.wrapping_add(u32::from_le_bytes(tail[0..4].try_into().unwrap()) as u64)
-        }
+        4..=7 => c = c.wrapping_add(u32::from_le_bytes(tail[0..4].try_into().unwrap()) as u64),
         3 => c = c.wrapping_add((tail[2] as u64) << 16),
         _ => {}
     }
@@ -165,7 +159,7 @@ pub fn hash128(msg: &[u8], seed: u64) -> [u32; 4] {
         _ => {}
     }
     match tail.len() & 0xf {
-        3 | 2 | 1 => c = c.wrapping_add(tail[0] as u64),
+        1..=3 => c = c.wrapping_add(tail[0] as u64),
         0 => {
             c = c.wrapping_add(MAGIC);
             d = d.wrapping_add(MAGIC);

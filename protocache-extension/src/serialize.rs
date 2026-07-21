@@ -30,7 +30,9 @@ pub(crate) fn serialize_protobuf_bytes_into_buffer<'b>(
     encode_dynamic_message_into_buffer(&message, buffer)
 }
 
-pub(crate) fn serialize_dynamic_message(message: &DynamicMessage) -> Result<Vec<u32>, MutableError> {
+pub(crate) fn serialize_dynamic_message(
+    message: &DynamicMessage,
+) -> Result<Vec<u32>, MutableError> {
     let mut buffer = Buffer::new();
     let _ = serialize_dynamic_message_into_buffer(message, &mut buffer)?;
     Ok(buffer.view().to_vec())
@@ -108,7 +110,10 @@ fn encode_dynamic_message(
             message.get_field(&field).as_ref(),
             buffer,
         )?;
-        if matches!(field.kind(), Kind::Message(_)) && !field.is_list() && !field.is_map() && unit.size() == 1
+        if matches!(field.kind(), Kind::Message(_))
+            && !field.is_list()
+            && !field.is_map()
+            && unit.size() == 1
         {
             if unit.is_segment() {
                 buffer.shrink(1);
@@ -236,13 +241,7 @@ fn encode_list_field(
     let mut units = Vec::with_capacity(items.len());
     let last = buffer.len();
     for item in items {
-        let mut unit = encode_kind_value(
-            descriptor_name,
-            field_name,
-            item_kind,
-            item,
-            buffer,
-        )?;
+        let mut unit = encode_kind_value(descriptor_name, field_name, item_kind, item, buffer)?;
         if matches!(item_kind, Kind::Message(_)) && unit.size() > 1 {
             fold_field(buffer, &mut unit);
         }
@@ -288,9 +287,11 @@ fn encode_map_field(
         keys[i] = encode_map_key(descriptor_name, field_name, key_kind, key, buffer)?;
         values[i] = encode_kind_value(descriptor_name, field_name, value_kind, value, buffer)?;
     }
-    serialize_map_at(&index, &keys, &values, buffer, last).ok_or_else(|| MutableError::SerializeFailed {
-        descriptor: descriptor_name.to_owned(),
-        field: field_name.to_owned(),
+    serialize_map_at(&index, &keys, &values, buffer, last).ok_or_else(|| {
+        MutableError::SerializeFailed {
+            descriptor: descriptor_name.to_owned(),
+            field: field_name.to_owned(),
+        }
     })
 }
 
@@ -314,7 +315,11 @@ fn map_key_bytes(
         (Kind::Uint64 | Kind::Fixed64, ReflectMapKey::U64(value)) => {
             Ok(value.to_le_bytes().to_vec())
         }
-        _ => Err(type_mismatch(descriptor_name, field_name, "supported map key")),
+        _ => Err(type_mismatch(
+            descriptor_name,
+            field_name,
+            "supported map key",
+        )),
     }
 }
 
@@ -344,7 +349,11 @@ fn encode_map_key(
         (Kind::Uint64 | Kind::Fixed64, ReflectMapKey::U64(value)) => {
             Ok(serialize_scalar::<u64>(*value))
         }
-        _ => Err(type_mismatch(descriptor_name, field_name, "supported map key")),
+        _ => Err(type_mismatch(
+            descriptor_name,
+            field_name,
+            "supported map key",
+        )),
     }
 }
 

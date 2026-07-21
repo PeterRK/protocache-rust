@@ -1,12 +1,9 @@
 //! Perfect-hash surface matching `perfect_hash.h`.
 
-pub use crate::serialize::{
-    build_perfect_hash_index,
-    build_perfect_hash_index_with_positions,
-};
+pub use crate::serialize::{build_perfect_hash_index, build_perfect_hash_index_with_positions};
 
-use crate::utils::{CorruptionKind, ReadError};
 use crate::hash::hash128;
+use crate::utils::{CorruptionKind, ReadError};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PerfectHashView<'a> {
@@ -25,7 +22,9 @@ impl<'a> PerfectHashView<'a> {
         let header = read_u32_le(data).ok_or(ReadError::new(CorruptionKind::Truncated))?;
         let len = (header & 0x0fff_ffff) as usize;
         if len <= 1 {
-            let data = data.get(..4).ok_or(ReadError::new(CorruptionKind::Truncated))?;
+            let data = data
+                .get(..4)
+                .ok_or(ReadError::new(CorruptionKind::Truncated))?;
             return Ok(Self {
                 data,
                 bitmap: &data[..0],
@@ -70,6 +69,11 @@ impl<'a> PerfectHashView<'a> {
     }
 
     #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
     pub fn locate(&self, key: &[u8]) -> Option<usize> {
         if self.len == 0 {
             return None;
@@ -83,14 +87,17 @@ impl<'a> PerfectHashView<'a> {
         let slots = [
             fast_mod_u32(code[0], self.section as u32, self.section_magic) as usize,
             fast_mod_u32(code[1], self.section as u32, self.section_magic) as usize + self.section,
-            fast_mod_u32(code[2], self.section as u32, self.section_magic) as usize + self.section * 2,
+            fast_mod_u32(code[2], self.section as u32, self.section_magic) as usize
+                + self.section * 2,
         ];
         self.locate_slots(slots)
     }
 
     #[inline(always)]
     fn locate_slots(&self, slots: [usize; 3]) -> Option<usize> {
-        let m = bit2(self.bitmap, slots[0])? + bit2(self.bitmap, slots[1])? + bit2(self.bitmap, slots[2])?;
+        let m = bit2(self.bitmap, slots[0])?
+            + bit2(self.bitmap, slots[1])?
+            + bit2(self.bitmap, slots[2])?;
         let slot = slots[(m % 3) as usize];
         let a = slot >> 5;
         let b = slot & 31;

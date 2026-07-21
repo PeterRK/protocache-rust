@@ -1,22 +1,28 @@
 //! Mutable surface matching `access-ex.h`.
 
-use std::collections::HashMap;
-use std::borrow::Borrow;
 use std::array;
+use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
 
+use crate::access::checked_slice_end;
+use crate::serialize::serialize_map_pairs_at_mut;
 use crate::{
     ArrayView, Buffer, FieldView, MapKey, MapView, MessageView, Scalar, StringView, Unit,
     build_perfect_hash_index_with_positions, fold_field, serialize_array_at_mut, serialize_bool,
     serialize_bytes, serialize_scalar, serialize_str,
 };
-use crate::serialize::serialize_map_pairs_at_mut;
 
 #[derive(Debug)]
 pub enum MutableError {
-    InvalidRoot { descriptor: String },
-    MissingField { descriptor: String, field: String },
+    InvalidRoot {
+        descriptor: String,
+    },
+    MissingField {
+        descriptor: String,
+        field: String,
+    },
     TypeMismatch {
         descriptor: String,
         field: String,
@@ -27,7 +33,10 @@ pub enum MutableError {
         field: String,
         key: String,
     },
-    SerializeFailed { descriptor: String, field: String },
+    SerializeFailed {
+        descriptor: String,
+        field: String,
+    },
 }
 
 impl std::fmt::Display for MutableError {
@@ -41,7 +50,10 @@ impl std::fmt::Display for MutableError {
                 descriptor,
                 field,
                 expected,
-            } => write!(f, "type mismatch for {descriptor}.{field}, expected {expected}"),
+            } => write!(
+                f,
+                "type mismatch for {descriptor}.{field}, expected {expected}"
+            ),
             Self::InvalidMapKey {
                 descriptor,
                 field,
@@ -456,9 +468,11 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
             pairs[i].0 = key.encode_key(buffer)?;
         }
 
-        serialize_map_pairs_at_mut(&index, &mut pairs, buffer, last).ok_or_else(|| MutableError::SerializeFailed {
-            descriptor: "<map>".to_owned(),
-            field: "<encode>".to_owned(),
+        serialize_map_pairs_at_mut(&index, &mut pairs, buffer, last).ok_or_else(|| {
+            MutableError::SerializeFailed {
+                descriptor: "<map>".to_owned(),
+                field: "<encode>".to_owned(),
+            }
         })
     }
 }
@@ -467,34 +481,34 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
 fn detect_array_words<'a, T: MutableField<'a>>(words: &'a [u32]) -> Option<&'a [u32]> {
     let array = ArrayView::new(words)?;
     let end = array.total_words();
-    let base_end = unsafe { words.as_ptr().add(end) };
     for index in (0..array.len()).rev() {
         let detected = T::detect(array.expect_field(index))?;
-        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
-            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
-            return words.get(..offset.checked_add(detected.len())?);
+        let detected_end = checked_slice_end(words, detected)?;
+        if detected_end > end {
+            return words.get(..detected_end);
         }
     }
     words.get(..end)
 }
 
 #[inline(always)]
-fn detect_map_words<'a, K: MutableMapKey<'a>, V: MutableField<'a>>(words: &'a [u32]) -> Option<&'a [u32]> {
+fn detect_map_words<'a, K: MutableMapKey<'a>, V: MutableField<'a>>(
+    words: &'a [u32],
+) -> Option<&'a [u32]> {
     let map = MapView::new(words)?;
     let end = map.total_words();
-    let base_end = unsafe { words.as_ptr().add(end) };
     for index in (0..map.len()).rev() {
         let pair = map.expect_pair(index);
         let detected = V::detect(pair.value())?;
-        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
-            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
-            return words.get(..offset.checked_add(detected.len())?);
+        let detected_end = checked_slice_end(words, detected)?;
+        if detected_end > end {
+            return words.get(..detected_end);
         }
 
         let detected = K::detect_key(pair.key())?;
-        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
-            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
-            return words.get(..offset.checked_add(detected.len())?);
+        let detected_end = checked_slice_end(words, detected)?;
+        if detected_end > end {
+            return words.get(..detected_end);
         }
     }
     words.get(..end)
@@ -557,7 +571,7 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
         if self.has_any_accessed() {
             None
         } else {
-            self.words.as_deref()
+            self.words
         }
     }
 
@@ -566,10 +580,7 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
             let word = id / 64;
             let bit = id % 64;
             self.accessed[word] |= 1u64 << bit;
-            *slot = self
-                .field(id)
-                .and_then(T::decode)
-                .unwrap_or_default();
+            *slot = self.field(id).and_then(T::decode).unwrap_or_default();
         }
         slot
     }
@@ -769,7 +780,10 @@ impl<'a> MutableArrayElement<'a> for bool {
     }
 
     fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        let bytes = values.iter().map(|value| u8::from(*value)).collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .map(|value| u8::from(*value))
+            .collect::<Vec<_>>();
         serialize_bytes(&bytes, buffer).ok_or_else(|| MutableError::SerializeFailed {
             descriptor: "<array>".to_owned(),
             field: "<bool-array>".to_owned(),
@@ -963,7 +977,11 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableField<'a> for Mutable
     }
 
     fn is_dirty(&self) -> bool {
-        self.dirty || self.entries.iter().any(|(_, value)| value.has_nested_dirty())
+        self.dirty
+            || self
+                .entries
+                .iter()
+                .any(|(_, value)| value.has_nested_dirty())
     }
 
     fn has_nested_dirty(&self) -> bool {
@@ -994,7 +1012,9 @@ impl<'a, T: MutableArrayElement<'a>> MutableArrayElement<'a> for MutableArray<'a
     }
 }
 
-impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableArrayElement<'a> for MutableMap<'a, K, V> {
+impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableArrayElement<'a>
+    for MutableMap<'a, K, V>
+{
     fn decode_array(words: &'a [u32]) -> Option<Vec<Self>> {
         let array = ArrayView::new(words)?;
         let mut values = Vec::with_capacity(array.len());
@@ -1035,7 +1055,10 @@ impl<'a, T: MutableField<'a>> MutableField<'a> for Box<T> {
     }
 }
 
-fn encode_object_array<'a, T: MutableField<'a>>(values: &[T], buffer: &mut Buffer) -> Result<Unit, MutableError> {
+fn encode_object_array<'a, T: MutableField<'a>>(
+    values: &[T],
+    buffer: &mut Buffer,
+) -> Result<Unit, MutableError> {
     const STACK_UNITS: usize = 32;
 
     if values.is_empty() {
@@ -1047,9 +1070,11 @@ fn encode_object_array<'a, T: MutableField<'a>>(values: &[T], buffer: &mut Buffe
         for i in (0..values.len()).rev() {
             units[i] = values[i].encode(buffer)?;
         }
-        return serialize_array_at_mut(&mut units[..values.len()], buffer, last).ok_or_else(|| MutableError::SerializeFailed {
-            descriptor: "<array>".to_owned(),
-            field: "<encode>".to_owned(),
+        return serialize_array_at_mut(&mut units[..values.len()], buffer, last).ok_or_else(|| {
+            MutableError::SerializeFailed {
+                descriptor: "<array>".to_owned(),
+                field: "<encode>".to_owned(),
+            }
         });
     }
 
@@ -1095,7 +1120,8 @@ mod tests {
 
     #[test]
     fn map_ex_mut_into_iter_marks_collection_dirty() {
-        let mut map = MutableMap::from_iter([("alpha".to_owned(), 1u32), ("beta".to_owned(), 2u32)]);
+        let mut map =
+            MutableMap::from_iter([("alpha".to_owned(), 1u32), ("beta".to_owned(), 2u32)]);
         assert!(!map.is_dirty());
 
         for (_, value) in &mut map {
@@ -1109,7 +1135,8 @@ mod tests {
 
     #[test]
     fn map_ex_supports_borrowed_string_lookup() {
-        let mut map = MutableMap::from_iter([("alpha".to_owned(), 1u32), ("beta".to_owned(), 2u32)]);
+        let mut map =
+            MutableMap::from_iter([("alpha".to_owned(), 1u32), ("beta".to_owned(), 2u32)]);
 
         assert!(map.contains_key("alpha"));
         assert_eq!(map.get("beta"), Some(&2));
@@ -1166,7 +1193,10 @@ mod tests {
     #[test]
     fn mutable_string_key_float_array_map_roundtrip() {
         let mut map = MutableMap::new();
-        map.insert("lv5".to_owned(), MutableArray::from(vec![51.0f32, 52.0, 53.0]));
+        map.insert(
+            "lv5".to_owned(),
+            MutableArray::from(vec![51.0f32, 52.0, 53.0]),
+        );
         map.insert("lv9".to_owned(), MutableArray::from(vec![91.0f32, 92.0]));
 
         let mut buffer = Buffer::new();
@@ -1176,9 +1206,18 @@ mod tests {
         let view = MapView::new(buffer.view()).unwrap();
         let available = view
             .iter()
-            .filter_map(|pair| pair.key().string().and_then(|key| key.as_str().map(str::to_owned)))
+            .filter_map(|pair| {
+                pair.key()
+                    .string()
+                    .and_then(|key| key.as_str().map(str::to_owned))
+            })
             .collect::<Vec<_>>();
-        let lv5 = view.find_str("lv5").unwrap_or_else(|| panic!("available keys: {available:?}, words: {:?}", buffer.view())).value().array().unwrap();
+        let lv5 = view
+            .find_str("lv5")
+            .unwrap_or_else(|| panic!("available keys: {available:?}, words: {:?}", buffer.view()))
+            .value()
+            .array()
+            .unwrap();
         assert_eq!(
             lv5.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
             vec![51.0, 52.0, 53.0]

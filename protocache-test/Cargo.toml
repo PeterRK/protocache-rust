@@ -1,7 +1,12 @@
 [package]
 name = "protocache-test"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 flatbuffers = "=2.1.2"
@@ -11,11 +16,12 @@ fory-derive = "=1.0.0"
 mimalloc = { version = "0.1", default-features = false }
 prost = "0.13.5"
 prost-reflect = "0.15.0"
-protocache-core = { path = "../protocache-core" }
-protocache-extension = { path = "../protocache-extension" }
+protocache-core = { version = "0.1.0", path = "../protocache-core" }
+protocache-extension = { version = "0.1.0", path = "../protocache-extension", features = ["native-proto"] }
 
 [build-dependencies]
 prost = "0.13.5"
 prost-build = "0.13.5"
+prost-reflect = { version = "0.15.0", features = ["serde"] }
 prost-types = "0.13.5"
-protocache-extension = { path = "../protocache-extension" }
+protocache-extension = { version = "0.1.0", path = "../protocache-extension" }

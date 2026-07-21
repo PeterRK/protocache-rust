@@ -32,13 +32,13 @@ pub mod encoding {
 }
 
 pub use access::{
-    ArrayIter, ArrayView, BoolArray, FieldDecode, FieldView, MapIter, MapKey, MapView,
-    MessageView, PairView, ScalarArray, StringView, ViewArray, ViewMap, detect_array_with,
-    detect_map_with, detect_slice_end,
+    ArrayIter, ArrayView, BoolArray, FieldDecode, FieldView, MapIter, MapKey, MapView, MessageView,
+    PairView, ScalarArray, StringView, ViewArray, ViewMap, detect_array_with, detect_map_with,
+    detect_slice_end,
 };
 pub use mutable::{
-    MutableArray, MutableArrayElement, MutableField, MutableMap, MutableMapKey, MutableMapKeyKind,
-    MutableMessage, MutableError, copy_words,
+    MutableArray, MutableArrayElement, MutableError, MutableField, MutableMap, MutableMapKey,
+    MutableMapKeyKind, MutableMessage, copy_words,
 };
 pub use perfect_hash::PerfectHashView;
 pub use serialize::{

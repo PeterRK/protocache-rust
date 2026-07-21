@@ -8,7 +8,7 @@ use prost_types::{
     field_descriptor_proto::{Label, Type},
 };
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-proto"))]
 pub(crate) fn build_descriptor_pool(
     files: &[FileDescriptorProto],
 ) -> Result<DescriptorPool, RegisterError> {
@@ -78,15 +78,43 @@ impl Descriptor {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RegisterError {
-    DuplicateDescriptor { name: String },
-    EmptyMessage { name: String },
-    InvalidAlias { name: String },
-    InvalidFieldNumber { message: String, field: String, number: i32 },
-    DuplicateFieldId { message: String, id: usize },
-    OverlySparseFieldIds { name: String, max_field_number: i32, field_count: usize },
-    UnsupportedFieldType { message: String, field: String },
-    UnsupportedMapKeyType { message: String, field: String, key: FieldType },
-    UnknownType { message: String, field: String, type_name: String },
+    DuplicateDescriptor {
+        name: String,
+    },
+    EmptyMessage {
+        name: String,
+    },
+    InvalidAlias {
+        name: String,
+    },
+    InvalidFieldNumber {
+        message: String,
+        field: String,
+        number: i32,
+    },
+    DuplicateFieldId {
+        message: String,
+        id: usize,
+    },
+    OverlySparseFieldIds {
+        name: String,
+        max_field_number: i32,
+        field_count: usize,
+    },
+    UnsupportedFieldType {
+        message: String,
+        field: String,
+    },
+    UnsupportedMapKeyType {
+        message: String,
+        field: String,
+        key: FieldType,
+    },
+    UnknownType {
+        message: String,
+        field: String,
+        type_name: String,
+    },
 }
 
 #[derive(Default)]
@@ -227,19 +255,22 @@ impl DescriptorPool {
         map_entries: &HashMap<String, DescriptorProto>,
     ) -> Result<Field, RegisterError> {
         let repeated = source.label() == Label::Repeated;
-        let mut value = convert_type(source).ok_or_else(|| RegisterError::UnsupportedFieldType {
-            message: message_name.to_owned(),
-            field: source.name().to_owned(),
-        })?;
+        let mut value =
+            convert_type(source).ok_or_else(|| RegisterError::UnsupportedFieldType {
+                message: message_name.to_owned(),
+                field: source.name().to_owned(),
+            })?;
 
         let mut key = FieldType::None;
         let mut value_type = String::new();
         if matches!(value, FieldType::Message | FieldType::Unknown) {
             let source_type = normalize_type_name(source.type_name());
             if let Some(entry) = map_entries.get(&source_type) {
-                let map_key = convert_type(&entry.field[0]).ok_or_else(|| RegisterError::UnsupportedFieldType {
-                    message: message_name.to_owned(),
-                    field: source.name().to_owned(),
+                let map_key = convert_type(&entry.field[0]).ok_or_else(|| {
+                    RegisterError::UnsupportedFieldType {
+                        message: message_name.to_owned(),
+                        field: source.name().to_owned(),
+                    }
                 })?;
                 let Some(map_key) = as_key_type(map_key) else {
                     return Err(RegisterError::UnsupportedMapKeyType {
@@ -248,9 +279,11 @@ impl DescriptorPool {
                         key: map_key,
                     });
                 };
-                let map_value = convert_type(&entry.field[1]).ok_or_else(|| RegisterError::UnsupportedFieldType {
-                    message: message_name.to_owned(),
-                    field: source.name().to_owned(),
+                let map_value = convert_type(&entry.field[1]).ok_or_else(|| {
+                    RegisterError::UnsupportedFieldType {
+                        message: message_name.to_owned(),
+                        field: source.name().to_owned(),
+                    }
                 })?;
                 key = map_key;
                 value = map_value;
@@ -303,13 +336,13 @@ impl DescriptorPool {
             return Ok(());
         }
         let unresolved = field.value_type.clone();
-        let resolved = self.resolve_type_name(message_name, &unresolved).ok_or_else(|| {
-            RegisterError::UnknownType {
+        let resolved = self
+            .resolve_type_name(message_name, &unresolved)
+            .ok_or_else(|| RegisterError::UnknownType {
                 message: message_name.to_owned(),
                 field: field_name.to_owned(),
                 type_name: unresolved.clone(),
-            }
-        })?;
+            })?;
 
         if self.enums.contains(&resolved) {
             field.value = FieldType::Enum;
@@ -421,13 +454,13 @@ fn collect_tags(options: Option<&[UninterpretedOption]>) -> HashMap<String, Stri
     for option in options.into_iter().flatten() {
         if option.name.len() == 1 {
             let name = &option.name[0];
-            if !name.is_extension {
-                if let Some(value) = &option.string_value {
-                    tags.insert(
-                        name.name_part.clone(),
-                        String::from_utf8_lossy(value).into_owned(),
-                    );
-                }
+            if !name.is_extension
+                && let Some(value) = &option.string_value
+            {
+                tags.insert(
+                    name.name_part.clone(),
+                    String::from_utf8_lossy(value).into_owned(),
+                );
             }
         }
     }
@@ -461,7 +494,8 @@ fn is_deprecated_enum(item: &EnumDescriptorProto) -> bool {
 }
 
 fn is_deprecated_field(field: &FieldDescriptorProto) -> bool {
-    field.options
+    field
+        .options
         .as_ref()
         .and_then(|opts| opts.deprecated)
         .unwrap_or(false)
@@ -474,17 +508,56 @@ fn collect_enum_values(item: &EnumDescriptorProto) -> BTreeMap<String, i32> {
         .collect()
 }
 
+fn validate_field_shape(name: &str, fields: &[FieldDescriptorProto]) -> Result<(), RegisterError> {
+    let field_count = fields.len();
+    if field_count == 0 {
+        return Err(RegisterError::EmptyMessage {
+            name: name.to_owned(),
+        });
+    }
+
+    let mut max_field_number = 1;
+    for field in fields {
+        let number = field.number();
+        if number <= 0 {
+            return Err(RegisterError::InvalidFieldNumber {
+                message: name.to_owned(),
+                field: field.name().to_owned(),
+                number,
+            });
+        }
+        max_field_number = max_field_number.max(number);
+    }
+
+    if max_field_number > (12 + 25 * 255)
+        || ((max_field_number as usize).saturating_sub(field_count) > 6
+            && (max_field_number as usize) > field_count * 2)
+    {
+        return Err(RegisterError::OverlySparseFieldIds {
+            name: name.to_owned(),
+            max_field_number,
+            field_count,
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
+    #[cfg(all(feature = "native-proto", target_family = "unix"))]
+    use prost_types::FileDescriptorSet;
     use prost_types::{
-        EnumValueDescriptorProto, FieldOptions, FileDescriptorSet, MessageOptions,
-        field_descriptor_proto::Label,
+        EnumValueDescriptorProto, FieldOptions, MessageOptions, field_descriptor_proto::Label,
     };
+    #[cfg(all(feature = "native-proto", target_family = "unix"))]
+    use std::path::PathBuf;
+    #[cfg(all(feature = "native-proto", target_family = "unix"))]
     use tempfile::TempDir;
 
+    #[cfg(all(feature = "native-proto", target_family = "unix"))]
     const TEST_SCHEMA: &str = r#"
         syntax = "proto3";
         package test;
@@ -550,7 +623,10 @@ mod tests {
         assert_eq!(object.value_type, "test.Small");
         let object_desc = pool.find(&object.value_type).unwrap();
         assert!(!object_desc.is_alias());
-        assert_eq!(object_desc.fields.get("flag").unwrap().value, FieldType::Bool);
+        assert_eq!(
+            object_desc.fields.get("flag").unwrap().value,
+            FieldType::Bool
+        );
 
         let index = root.fields.get("index").unwrap();
         assert!(index.repeated);
@@ -620,9 +696,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "native-proto", target_family = "unix"))]
     fn registers_descriptor_emitted_by_protoc_for_targeted_schema() {
         let (_dir, path) = write_test_proto();
-        let descriptor_set = compile_descriptor_set(path.parent().unwrap().to_path_buf(), "test.proto");
+        let descriptor_set =
+            compile_descriptor_set(path.parent().unwrap().to_path_buf(), "test.proto");
         let file = descriptor_set
             .file
             .into_iter()
@@ -781,16 +859,68 @@ mod tests {
             name: Some("Main".to_owned()),
             field: vec![
                 scalar_field("id", 1, Type::Int32),
-                named_field("score", 2, Label::Optional, Type::Double, None, false, &[tag("mark", "xyz")]),
-                named_field("mode", 3, Label::Optional, Type::Enum, Some("Mode"), false, &[]),
-                named_field("object", 4, Label::Optional, Type::Message, Some("Small"), false, &[]),
-                named_field("index", 5, Label::Repeated, Type::Message, Some("Main.IndexEntry"), false, &[]),
-                named_field("matrix", 6, Label::Optional, Type::Message, Some("Vec2D"), false, &[]),
-                named_field("arrays", 7, Label::Optional, Type::Message, Some("ArrMap"), false, &[]),
+                named_field(
+                    "score",
+                    2,
+                    Label::Optional,
+                    Type::Double,
+                    None,
+                    false,
+                    &[tag("mark", "xyz")],
+                ),
+                named_field(
+                    "mode",
+                    3,
+                    Label::Optional,
+                    Type::Enum,
+                    Some("Mode"),
+                    false,
+                    &[],
+                ),
+                named_field(
+                    "object",
+                    4,
+                    Label::Optional,
+                    Type::Message,
+                    Some("Small"),
+                    false,
+                    &[],
+                ),
+                named_field(
+                    "index",
+                    5,
+                    Label::Repeated,
+                    Type::Message,
+                    Some("Main.IndexEntry"),
+                    false,
+                    &[],
+                ),
+                named_field(
+                    "matrix",
+                    6,
+                    Label::Optional,
+                    Type::Message,
+                    Some("Vec2D"),
+                    false,
+                    &[],
+                ),
+                named_field(
+                    "arrays",
+                    7,
+                    Label::Optional,
+                    Type::Message,
+                    Some("ArrMap"),
+                    false,
+                    &[],
+                ),
             ],
-            nested_type: vec![
-                map_entry("IndexEntry", Type::String, None, Type::Int32, None),
-            ],
+            nested_type: vec![map_entry(
+                "IndexEntry",
+                Type::String,
+                None,
+                Type::Int32,
+                None,
+            )],
             options: Some(MessageOptions {
                 uninterpreted_option: vec![tag("test_a", "123"), tag("test_b", "123")],
                 ..MessageOptions::default()
@@ -836,7 +966,15 @@ mod tests {
             )],
             nested_type: vec![DescriptorProto {
                 name: Some("Vec1D".to_owned()),
-                field: vec![named_field("_", 1, Label::Repeated, Type::Float, None, false, &[])],
+                field: vec![named_field(
+                    "_",
+                    1,
+                    Label::Repeated,
+                    Type::Float,
+                    None,
+                    false,
+                    &[],
+                )],
                 ..DescriptorProto::default()
             }],
             ..DescriptorProto::default()
@@ -858,10 +996,24 @@ mod tests {
             nested_type: vec![
                 DescriptorProto {
                     name: Some("Array".to_owned()),
-                    field: vec![named_field("_", 1, Label::Repeated, Type::Float, None, false, &[])],
+                    field: vec![named_field(
+                        "_",
+                        1,
+                        Label::Repeated,
+                        Type::Float,
+                        None,
+                        false,
+                        &[],
+                    )],
                     ..DescriptorProto::default()
                 },
-                map_entry("Entry", Type::String, None, Type::Message, Some("ArrMap.Array")),
+                map_entry(
+                    "Entry",
+                    Type::String,
+                    None,
+                    Type::Message,
+                    Some("ArrMap.Array"),
+                ),
             ],
             ..DescriptorProto::default()
         }
@@ -901,8 +1053,24 @@ mod tests {
         DescriptorProto {
             name: Some(name.to_owned()),
             field: vec![
-                named_field("key", 1, Label::Optional, key_type, key_type_name, false, &[]),
-                named_field("value", 2, Label::Optional, value_type, value_type_name, false, &[]),
+                named_field(
+                    "key",
+                    1,
+                    Label::Optional,
+                    key_type,
+                    key_type_name,
+                    false,
+                    &[],
+                ),
+                named_field(
+                    "value",
+                    2,
+                    Label::Optional,
+                    value_type,
+                    value_type_name,
+                    false,
+                    &[],
+                ),
             ],
             options: Some(MessageOptions {
                 map_entry: Some(true),
@@ -955,10 +1123,12 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "native-proto", target_family = "unix"))]
     fn compile_descriptor_set(proto_dir: PathBuf, file_name: &str) -> FileDescriptorSet {
         crate::proto::parse_proto_file_set(proto_dir.join(file_name)).unwrap()
     }
 
+    #[cfg(all(feature = "native-proto", target_family = "unix"))]
     fn write_test_proto() -> (TempDir, PathBuf) {
         let dir = tempfile::Builder::new()
             .prefix("pcrs-reflect-schema-")
@@ -968,39 +1138,4 @@ mod tests {
         std::fs::write(&path, TEST_SCHEMA).unwrap();
         (dir, path)
     }
-}
-
-fn validate_field_shape(name: &str, fields: &[FieldDescriptorProto]) -> Result<(), RegisterError> {
-    let field_count = fields.len();
-    if field_count == 0 {
-        return Err(RegisterError::EmptyMessage {
-            name: name.to_owned(),
-        });
-    }
-
-    let mut max_field_number = 1;
-    for field in fields {
-        let number = field.number();
-        if number <= 0 {
-            return Err(RegisterError::InvalidFieldNumber {
-                message: name.to_owned(),
-                field: field.name().to_owned(),
-                number,
-            });
-        }
-        max_field_number = max_field_number.max(number);
-    }
-
-    if max_field_number > (12 + 25 * 255)
-        || ((max_field_number as usize).saturating_sub(field_count) > 6
-            && (max_field_number as usize) > field_count * 2)
-    {
-        return Err(RegisterError::OverlySparseFieldIds {
-            name: name.to_owned(),
-            max_field_number,
-            field_count,
-        });
-    }
-
-    Ok(())
 }

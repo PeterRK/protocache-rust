@@ -1,21 +1,21 @@
 use std::ffi::CString;
+#[cfg(test)]
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
-use std::os::unix::ffi::OsStrExt;
-#[cfg(test)]
-use std::fs;
 
-use prost::Message;
-use prost_reflect::DescriptorError as ReflectDescriptorError;
-use prost_types::FileDescriptorProto;
-#[cfg(test)]
-use prost_types::FileDescriptorSet;
 use crate::reflection::RegisterError;
 #[cfg(test)]
 use crate::reflection::{DescriptorPool, build_descriptor_pool};
+use prost::Message;
+use prost_reflect::DescriptorError as ReflectDescriptorError;
 #[cfg(test)]
 use prost_reflect::DescriptorPool as ReflectDescriptorPool;
+use prost_types::FileDescriptorProto;
+#[cfg(test)]
+use prost_types::FileDescriptorSet;
 #[derive(Debug)]
 pub enum ProtoError {
     Io(std::io::Error),
@@ -103,12 +103,7 @@ pub fn parse_proto_file(path: impl AsRef<Path>) -> Result<FileDescriptorProto, P
     let bytes = unsafe {
         parse_proto_via_ffi(
             |out_bytes, out_len, out_error| {
-                protocache_parse_proto_file(
-                    path_cstr.as_ptr(),
-                    out_bytes,
-                    out_len,
-                    out_error,
-                )
+                protocache_parse_proto_file(path_cstr.as_ptr(), out_bytes, out_len, out_error)
             },
             "libprotoc file parser failed",
         )?
@@ -121,9 +116,7 @@ pub(crate) fn load_descriptor_pool_from_proto(
     source: &str,
     file_name: &str,
 ) -> Result<DescriptorPool, ProtoError> {
-    let temp_dir = tempfile::Builder::new()
-        .prefix("parse-proto-")
-        .tempdir()?;
+    let temp_dir = tempfile::Builder::new().prefix("parse-proto-").tempdir()?;
     let proto_path = temp_dir.path().join(file_name);
     if let Some(parent) = proto_path.parent() {
         fs::create_dir_all(parent)?;
@@ -147,12 +140,13 @@ pub(crate) fn load_reflect_descriptor_pool_from_proto_file(
     path: impl AsRef<Path>,
 ) -> Result<ReflectDescriptorPool, ProtoError> {
     let set = parse_proto_file_set_with_imports(path.as_ref(), &[])?;
-    ReflectDescriptorPool::from_file_descriptor_set(set)
-        .map_err(ProtoError::Reflect)
+    ReflectDescriptorPool::from_file_descriptor_set(set).map_err(ProtoError::Reflect)
 }
 
 #[cfg(test)]
-pub(crate) fn parse_proto_file_set(path: impl AsRef<Path>) -> Result<FileDescriptorSet, ProtoError> {
+pub(crate) fn parse_proto_file_set(
+    path: impl AsRef<Path>,
+) -> Result<FileDescriptorSet, ProtoError> {
     parse_proto_file_set_with_imports(path.as_ref(), &[])
 }
 
@@ -191,7 +185,10 @@ fn parse_descriptor_set_bytes(
         .iter()
         .map(|import| path_to_cstring(import))
         .collect::<Result<Vec<_>, _>>()?;
-    let import_ptrs = import_cstrs.iter().map(|import| import.as_ptr()).collect::<Vec<_>>();
+    let import_ptrs = import_cstrs
+        .iter()
+        .map(|import| import.as_ptr())
+        .collect::<Vec<_>>();
 
     let mut out_bytes = std::ptr::null_mut();
     let mut out_len = 0usize;
@@ -295,7 +292,6 @@ unsafe extern "C" {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -376,15 +372,24 @@ mod tests {
         let file = parse_proto_file(&path).unwrap();
 
         assert_eq!(file.package(), "test");
-        assert!(file.message_type.iter().any(|message| message.name() == "Main"));
-        assert!(file
-            .message_type
-            .iter()
-            .find(|message| message.name() == "AliasMap")
-            .unwrap()
-            .nested_type
-            .iter()
-            .any(|nested| nested.options.as_ref().and_then(|opts| opts.map_entry).unwrap_or(false)));
+        assert!(
+            file.message_type
+                .iter()
+                .any(|message| message.name() == "Main")
+        );
+        assert!(
+            file.message_type
+                .iter()
+                .find(|message| message.name() == "AliasMap")
+                .unwrap()
+                .nested_type
+                .iter()
+                .any(|nested| nested
+                    .options
+                    .as_ref()
+                    .and_then(|opts| opts.map_entry)
+                    .unwrap_or(false))
+        );
     }
 
     #[test]
@@ -394,7 +399,10 @@ mod tests {
 
         let (_dir, path) = test_schema_file();
         let err = parse_proto_file(path.parent().unwrap().join("missing.proto")).unwrap_err();
-        assert!(matches!(err, ProtoError::ParseFailed { .. } | ProtoError::Io(_)));
+        assert!(matches!(
+            err,
+            ProtoError::ParseFailed { .. } | ProtoError::Io(_)
+        ));
     }
 
     #[test]
@@ -475,7 +483,8 @@ mod tests {
             ),
         ]);
 
-        let pool = load_reflect_descriptor_pool_from_proto_file(dir.path().join("root.proto")).unwrap();
+        let pool =
+            load_reflect_descriptor_pool_from_proto_file(dir.path().join("root.proto")).unwrap();
         let root = pool.get_message_by_name("demo.Root").unwrap();
         let child = root.get_field_by_name("child").unwrap();
         let child_kind = child.kind();
@@ -499,7 +508,9 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ProtoError::Register(RegisterError::OverlySparseFieldIds { .. }))
+            Err(ProtoError::Register(
+                RegisterError::OverlySparseFieldIds { .. }
+            ))
         ));
     }
 }

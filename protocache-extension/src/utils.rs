@@ -7,10 +7,13 @@ use prost::Message;
 use prost_reflect::{
     DeserializeOptions, DynamicMessage, MessageDescriptor, ReflectMessage, SerializeOptions,
 };
+#[cfg(all(feature = "native-proto", target_family = "unix"))]
 use prost_types::FileDescriptorProto;
 use protocache_core::{Buffer, MutableError};
 
+#[cfg(all(feature = "native-proto", target_family = "unix"))]
 pub use crate::proto::ProtoError;
+#[cfg(all(feature = "native-proto", target_family = "unix"))]
 pub use crate::proto::parse_proto;
 
 #[derive(Debug)]
@@ -105,10 +108,7 @@ pub fn load_json(
     Ok(message)
 }
 
-pub fn dump_json(
-    message: &impl ReflectMessage,
-    path: impl AsRef<Path>,
-) -> Result<(), JsonError> {
+pub fn dump_json(message: &impl ReflectMessage, path: impl AsRef<Path>) -> Result<(), JsonError> {
     let dynamic = message.transcode_to_dynamic();
     let file = fs::File::create(path)?;
     let writer = std::io::BufWriter::new(file);
@@ -121,6 +121,7 @@ pub fn dump_json(
     Ok(())
 }
 
+#[cfg(all(feature = "native-proto", target_family = "unix"))]
 pub fn parse_proto_file(path: impl AsRef<Path>) -> Result<FileDescriptorProto, ProtoError> {
     crate::proto::parse_proto_file(path)
 }

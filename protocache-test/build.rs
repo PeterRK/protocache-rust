@@ -2,12 +2,12 @@ use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use prost::Message;
-use prost_types::compiler::{CodeGeneratorRequest, CodeGeneratorResponse};
 use prost_types::FileDescriptorSet;
+use prost_types::compiler::{CodeGeneratorRequest, CodeGeneratorResponse};
 
 #[derive(Debug)]
 struct GeneratedFile {
@@ -16,31 +16,39 @@ struct GeneratedFile {
 }
 
 fn main() {
+    for cfg in [
+        "protocache_test_has_protobuf_generated",
+        "protocache_test_has_flatbuffers_generated",
+        "protocache_test_has_fory_generated",
+    ] {
+        println!("cargo:rustc-check-cfg=cfg({cfg})");
+    }
+
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo_root = manifest_dir.parent().unwrap().to_path_buf();
     let fixture_root = repo_root.join("tests/fixtures");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let checked_in_pcrs_generated_path = manifest_dir.join("src/test.pc.rs");
     let checked_in_pcrs_extra_generated_path = manifest_dir.join("src/test.pc-ex.rs");
-    let flatc = env::var_os("FLATC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("flatc"));
-    let foryc = env::var_os("FORYC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("foryc"));
-    let protoc_gen_pcrs = env::var_os("PROTOC_GEN_PCRS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("protoc-gen-pcrs"));
-    let protoc_gen_pcrs_parameter = env::var("PROTOC_GEN_PCRS_PARAMETER")
-        .unwrap_or_else(|_| "extra".to_owned());
+    let test_proto = fixture_root.join("proto/test.proto");
+    let test_json = fixture_root.join("json/test.json");
+    let required = [
+        test_proto.clone(),
+        test_json.clone(),
+        fixture_root.join("proto/reflect-test.proto"),
+        fixture_root.join("json/test-alias.json"),
+    ];
 
-    println!(
-        "cargo:rerun-if-changed={}",
-        fixture_root.join("proto/test.proto").display()
-    );
+    for path in &required {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     println!(
         "cargo:rerun-if-changed={}",
         fixture_root.join("benchmark/test.fbs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        fixture_root.join("benchmark/test-fb.json").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
@@ -59,100 +67,250 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FLATC");
     println!("cargo:rerun-if-env-changed=FORYC");
 
+    let missing = required
+        .iter()
+        .filter(|path| !path.is_file())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        println!(
+            "cargo:warning=skipping protocache-test resource-dependent tests; missing: {}",
+            missing.join(", ")
+        );
+        return;
+    }
+
     let prost_proto = out_dir.join("test-prost.proto");
     let pcrs_proto = out_dir.join("test-pcrs.proto");
-    let mut prost_source = fs::read_to_string(fixture_root.join("proto/test.proto")).unwrap();
+    let mut prost_source = fs::read_to_string(&test_proto).unwrap();
     prost_source = prost_source.replace("repeated float _ = 1;", "repeated float values = 1;");
     prost_source = prost_source.replace("repeated Vec1D _ = 1;", "repeated Vec1D values = 1;");
-    prost_source = prost_source.replace("map<string,Array> _ = 1;", "map<string,Array> entries = 1;");
+    prost_source =
+        prost_source.replace("map<string,Array> _ = 1;", "map<string,Array> entries = 1;");
     prost_source = prost_source.replace(
         "\tArrMap arrays = 30;\n}",
         "\tArrMap arrays = 30;\n\trepeated Mode modev = 32;\n}",
     );
     fs::write(&prost_proto, prost_source).unwrap();
 
-    let mut pcrs_source = fs::read_to_string(fixture_root.join("proto/test.proto")).unwrap();
+    let mut pcrs_source = fs::read_to_string(&test_proto).unwrap();
     pcrs_source = pcrs_source.replace(
         "\tArrMap arrays = 30;\n}",
         "\tArrMap arrays = 30;\n\trepeated Mode modev = 32;\n}",
     );
     fs::write(&pcrs_proto, pcrs_source).unwrap();
 
-    prost_build::Config::new()
+    if let Err(err) = prost_build::Config::new()
         .out_dir(&out_dir)
-        .compile_protos(&[prost_proto], &[out_dir.clone()])
-        .unwrap();
+        .compile_protos(&[prost_proto], std::slice::from_ref(&out_dir))
+    {
+        println!("cargo:warning=skipping protocache-test resource-dependent tests: {err}");
+        return;
+    }
 
+    if let Err(err) = try_generate_binary_fixtures(&test_proto, &test_json, &out_dir) {
+        println!(
+            "cargo:warning=skipping protocache-test resource-dependent tests; failed to generate Protobuf/ProtoCache fixtures: {err}"
+        );
+        return;
+    }
+    println!("cargo:rustc-cfg=protocache_test_has_protobuf_generated");
+
+    let protoc_gen_pcrs = env::var_os("PROTOC_GEN_PCRS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("protoc-gen-pcrs"));
+    let parameter = env::var("PROTOC_GEN_PCRS_PARAMETER").unwrap_or_else(|_| "extra".to_owned());
+    if let Err(err) = try_regenerate_pcrs(
+        &out_dir,
+        &protoc_gen_pcrs,
+        normalize_parameter(&parameter),
+        &checked_in_pcrs_generated_path,
+        &checked_in_pcrs_extra_generated_path,
+    ) {
+        println!("cargo:warning=skipping pcrs regeneration; using checked-in bindings: {err}");
+    }
+
+    let flatc = env::var_os("FLATC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("flatc"));
+    match try_generate_flatbuffers(&fixture_root, &out_dir, &flatc) {
+        Ok(()) => println!("cargo:rustc-cfg=protocache_test_has_flatbuffers_generated"),
+        Err(err) => println!("cargo:warning=skipping FlatBuffers benchmarks/tests: {err}"),
+    }
+
+    let foryc = env::var_os("FORYC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("foryc"));
+    match try_generate_fory(&fixture_root, &out_dir, &foryc) {
+        Ok(()) => println!("cargo:rustc-cfg=protocache_test_has_fory_generated"),
+        Err(err) => println!("cargo:warning=skipping Fory benchmarks/tests: {err}"),
+    }
+}
+
+fn try_generate_binary_fixtures(schema: &Path, json: &Path, out_dir: &Path) -> Result<(), String> {
+    let descriptor_path = out_dir.join("benchmark-fixture.desc");
+    let proto_dir = schema
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", schema.display()))?;
+    let proto_name = schema
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", schema.display()))?;
+    let status = Command::new("protoc")
+        .arg(format!("--proto_path={}", proto_dir.display()))
+        .arg(format!(
+            "--descriptor_set_out={}",
+            descriptor_path.display()
+        ))
+        .arg(proto_name)
+        .status()
+        .map_err(|err| format!("failed to launch protoc: {err}"))?;
+    if !status.success() {
+        return Err(format!("protoc exited with status {status}"));
+    }
+
+    let descriptor_bytes = fs::read(&descriptor_path).map_err(|err| err.to_string())?;
+    let descriptor_set =
+        FileDescriptorSet::decode(descriptor_bytes.as_slice()).map_err(|err| err.to_string())?;
+    let pool = prost_reflect::DescriptorPool::from_file_descriptor_set(descriptor_set)
+        .map_err(|err| err.to_string())?;
+    let descriptor = pool
+        .get_message_by_name("test.Main")
+        .ok_or_else(|| "missing test.Main descriptor".to_owned())?;
+    let message =
+        protocache_extension::utils::load_json(json, descriptor).map_err(|err| err.to_string())?;
+
+    fs::write(out_dir.join("test.pb"), message.encode_to_vec()).map_err(|err| err.to_string())?;
+    let words = protocache_extension::utils::serialize_dynamic(&message)
+        .map_err(|err| format!("failed to serialize ProtoCache fixture: {err:?}"))?;
+    let bytes = words
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    fs::write(out_dir.join("test.pc"), bytes).map_err(|err| err.to_string())
+}
+
+fn try_regenerate_pcrs(
+    out_dir: &Path,
+    generator: &Path,
+    parameter: Option<String>,
+    readonly_path: &Path,
+    extra_path: &Path,
+) -> Result<(), String> {
     let descriptor_path = out_dir.join("benchmark-test.desc");
     let status = Command::new("protoc")
         .arg(format!("--proto_path={}", out_dir.display()))
-        .arg(format!("--descriptor_set_out={}", descriptor_path.display()))
+        .arg(format!(
+            "--descriptor_set_out={}",
+            descriptor_path.display()
+        ))
         .arg("test-pcrs.proto")
         .status()
-        .unwrap();
+        .map_err(|err| format!("failed to launch protoc: {err}"))?;
     if !status.success() {
-        panic!("protoc failed to generate benchmark descriptor set");
+        return Err(format!("protoc exited with status {status}"));
     }
-    let descriptor_bytes = fs::read(&descriptor_path).unwrap();
-    let descriptor_set = FileDescriptorSet::decode(descriptor_bytes.as_slice()).unwrap();
-    let pcrs_file = descriptor_set
+    let descriptor_bytes = fs::read(&descriptor_path).map_err(|err| err.to_string())?;
+    let descriptor_set =
+        FileDescriptorSet::decode(descriptor_bytes.as_slice()).map_err(|err| err.to_string())?;
+    let file = descriptor_set
         .file
         .into_iter()
         .find(|file| file.name() == "test-pcrs.proto")
-        .unwrap();
-    match generate_with_protoc_gen_pcrs(&protoc_gen_pcrs, pcrs_file, normalize_parameter(&protoc_gen_pcrs_parameter)).unwrap() {
-        Some(generated_files) => write_generated_files(
-            &generated_files,
-            &checked_in_pcrs_generated_path,
-            &checked_in_pcrs_extra_generated_path,
-        ),
-        None => {
-            println!(
-                "cargo:warning=skipping pcrs regeneration because {:?} was not found; using checked-in {} and {}",
-                protoc_gen_pcrs,
-                checked_in_pcrs_generated_path.display(),
-                checked_in_pcrs_extra_generated_path.display()
-            );
+        .ok_or_else(|| "missing test-pcrs.proto descriptor".to_owned())?;
+    match generate_with_protoc_gen_pcrs(generator, file, parameter)? {
+        Some(files) => write_generated_files(&files, readonly_path, extra_path),
+        None => return Err(format!("{generator:?} was not found")),
+    }
+    Ok(())
+}
+
+fn try_generate_flatbuffers(
+    fixture_root: &std::path::Path,
+    out_dir: &std::path::Path,
+    flatc: &std::path::Path,
+) -> Result<(), String> {
+    let source_path = fixture_root.join("benchmark/test.fbs");
+    let json_path = fixture_root.join("benchmark/test-fb.json");
+    for path in [&source_path, &json_path] {
+        if !path.is_file() {
+            return Err(format!("missing {}", path.display()));
         }
     }
 
-    let flatbuffers_schema = out_dir.join("test.fbs");
-    let mut flatbuffers_source = fs::read_to_string(fixture_root.join("benchmark/test.fbs")).unwrap();
-    flatbuffers_source = flatbuffers_source.replace("_:[float];", "values:[float];");
-    flatbuffers_source = flatbuffers_source.replace("_:[Vec1D];", "values:[Vec1D];");
-    flatbuffers_source = flatbuffers_source.replace("_:[ArrMapEntry];", "entries:[ArrMapEntry];");
-    flatbuffers_source = flatbuffers_source.replace("_:[byte];", "bytes:[byte];");
-    fs::write(&flatbuffers_schema, flatbuffers_source).unwrap();
+    let status = Command::new(flatc)
+        .arg("--binary")
+        .arg("-o")
+        .arg(out_dir)
+        .arg(&source_path)
+        .arg(&json_path)
+        .status()
+        .map_err(|err| format!("failed to launch {flatc:?}: {err}"))?;
+    if !status.success() {
+        return Err(format!(
+            "{flatc:?} binary generation exited with status {status}"
+        ));
+    }
+    let binary = out_dir.join("test-fb.bin");
+    if !binary.is_file() {
+        return Err(format!("{flatc:?} did not generate {}", binary.display()));
+    }
 
-    let status = Command::new(&flatc)
+    let mut source = fs::read_to_string(&source_path)
+        .map_err(|err| format!("{}: {err}", source_path.display()))?;
+    source = source.replace("_:[float];", "values:[float];");
+    source = source.replace("_:[Vec1D];", "values:[Vec1D];");
+    source = source.replace("_:[ArrMapEntry];", "entries:[ArrMapEntry];");
+    source = source.replace("_:[byte];", "bytes:[byte];");
+    let rust_schema = out_dir.join("test.fbs");
+    fs::write(&rust_schema, source).map_err(|err| err.to_string())?;
+
+    let status = Command::new(flatc)
         .arg("--rust")
         .arg("-o")
-        .arg(&out_dir)
-        .arg(&flatbuffers_schema)
+        .arg(out_dir)
+        .arg(&rust_schema)
         .status()
-        .unwrap();
+        .map_err(|err| format!("failed to launch {flatc:?}: {err}"))?;
     if !status.success() {
-        panic!("flatc {:?} failed with status {status}", flatc);
+        return Err(format!(
+            "{flatc:?} Rust generation exited with status {status}"
+        ));
     }
 
     let generated_path = out_dir.join("test_generated.rs");
-    let mut generated = fs::read_to_string(&generated_path).unwrap();
+    let mut generated = fs::read_to_string(&generated_path).map_err(|err| err.to_string())?;
     rewrite_flatbuffers_generated_identifiers(&mut generated);
-    fs::write(generated_path, generated).unwrap();
+    fs::write(generated_path, generated).map_err(|err| err.to_string())
+}
 
-    let status = Command::new(&foryc)
-        .arg(fixture_root.join("benchmark/test.fdl"))
+fn try_generate_fory(
+    fixture_root: &std::path::Path,
+    out_dir: &std::path::Path,
+    foryc: &std::path::Path,
+) -> Result<(), String> {
+    let fixture = fixture_root.join("benchmark/test.fr");
+    if !fixture.is_file() {
+        return Err(format!("missing {}", fixture.display()));
+    }
+    let schema = fixture_root.join("benchmark/test.fdl");
+    if !schema.is_file() {
+        return Err(format!("missing {}", schema.display()));
+    }
+    let status = Command::new(foryc)
+        .arg(&schema)
         .arg("--rust_out")
-        .arg(&out_dir)
+        .arg(out_dir)
         .status()
-        .unwrap_or_else(|err| panic!("failed to launch foryc {:?}: {err}", foryc));
-    if !status.success() {
-        panic!("foryc {:?} failed with status {status}", foryc);
+        .map_err(|err| format!("failed to launch {foryc:?}: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{foryc:?} exited with status {status}"))
     }
 }
 
 fn generate_with_protoc_gen_pcrs(
-    generator: &PathBuf,
+    generator: &Path,
     file: prost_types::FileDescriptorProto,
     parameter: Option<String>,
 ) -> Result<Option<Vec<GeneratedFile>>, String> {
@@ -173,7 +331,7 @@ fn generate_with_protoc_gen_pcrs(
         .spawn()
         .map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
-                return format!("not found");
+                return "not found".to_owned();
             }
             format!("failed to launch {:?}: {err}", generator)
         });
@@ -230,7 +388,7 @@ fn generate_with_protoc_gen_pcrs(
     Ok(Some(generated_files))
 }
 
-fn write_if_changed(path: &PathBuf, contents: &str) {
+fn write_if_changed(path: &Path, contents: &str) {
     match fs::read_to_string(path) {
         Ok(existing) if existing == contents => {}
         _ => fs::write(path, contents).unwrap(),
@@ -239,8 +397,8 @@ fn write_if_changed(path: &PathBuf, contents: &str) {
 
 fn write_generated_files(
     generated_files: &[GeneratedFile],
-    readonly_path: &PathBuf,
-    extra_path: &PathBuf,
+    readonly_path: &Path,
+    extra_path: &Path,
 ) {
     let mut readonly = None;
     let mut extra = None;
@@ -368,9 +526,21 @@ fn rewrite_flatbuffers_generated_identifiers(generated: &mut String) {
         "self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Bytes::VT__, bytes);",
     );
 
-    *generated = generated.replacen(r#"ds.field("_", &self._());"#, r#"ds.field("values", &self.values());"#, 3);
-    *generated = generated.replacen(r#"ds.field("_", &self._());"#, r#"ds.field("entries", &self.entries());"#, 1);
-    *generated = generated.replacen(r#"ds.field("_", &self._());"#, r#"ds.field("bytes", &self.bytes());"#, 1);
+    *generated = generated.replacen(
+        r#"ds.field("_", &self._());"#,
+        r#"ds.field("values", &self.values());"#,
+        3,
+    );
+    *generated = generated.replacen(
+        r#"ds.field("_", &self._());"#,
+        r#"ds.field("entries", &self.entries());"#,
+        1,
+    );
+    *generated = generated.replacen(
+        r#"ds.field("_", &self._());"#,
+        r#"ds.field("bytes", &self.bytes());"#,
+        1,
+    );
 
     *generated = generated.replacen(
         r#".visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, f32>>>("_", Self::VT__, false)?"#,

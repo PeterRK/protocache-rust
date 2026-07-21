@@ -1,6 +1,14 @@
 [package]
 name = "protocache-core"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Core zero-copy runtime and encoding primitives for ProtoCache"
+keywords = ["protobuf", "serialization", "zero-copy", "binary-format"]
+categories = ["encoding", "data-structures"]
 
 [dependencies]

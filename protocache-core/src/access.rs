@@ -2,8 +2,8 @@
 
 use core::marker::PhantomData;
 
-use crate::utils::{Scalar, word_size};
 use crate::perfect_hash::PerfectHashView;
+use crate::utils::{Scalar, word_size};
 
 pub trait MapKey {
     fn as_key_bytes(&self) -> Vec<u8>;
@@ -443,7 +443,6 @@ impl<'a> MessageView<'a> {
             width,
         })
     }
-
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -841,7 +840,6 @@ impl<'a> MapView<'a> {
         }
     }
 
-
     #[inline(always)]
     pub fn iter(self) -> MapIter<'a> {
         MapIter {
@@ -1072,9 +1070,29 @@ impl<'a> FieldDecode<'a> for MapView<'a> {
 
 #[inline(always)]
 pub fn detect_slice_end(words: &[u32], detected: &[u32], end: &mut usize) -> Option<()> {
-    let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
-    *end = (*end).max(offset.checked_add(detected.len())?);
+    *end = (*end).max(checked_slice_end(words, detected)?);
     Some(())
+}
+
+#[inline(always)]
+pub(crate) fn checked_slice_end(words: &[u32], detected: &[u32]) -> Option<usize> {
+    let word_size = core::mem::size_of::<u32>();
+    let words_start = words.as_ptr().addr();
+    let words_end = words_start.checked_add(words.len().checked_mul(word_size)?)?;
+    let detected_start = detected.as_ptr().addr();
+    let detected_end = detected_start.checked_add(detected.len().checked_mul(word_size)?)?;
+
+    if detected_start < words_start || detected_end > words_end {
+        return None;
+    }
+
+    let byte_offset = detected_start.checked_sub(words_start)?;
+    if !byte_offset.is_multiple_of(word_size) {
+        return None;
+    }
+    byte_offset
+        .checked_div(word_size)?
+        .checked_add(detected.len())
 }
 
 #[inline(always)]
@@ -1084,12 +1102,11 @@ pub fn detect_array_with<'a>(
 ) -> Option<&'a [u32]> {
     let array = ArrayView::new(words)?;
     let end = array.total_words();
-    let base_end = unsafe { words.as_ptr().add(end) };
     for index in (0..array.len()).rev() {
         let detected = detect(array.expect_field(index))?;
-        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
-            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
-            return words.get(..offset.checked_add(detected.len())?);
+        let detected_end = checked_slice_end(words, detected)?;
+        if detected_end > end {
+            return words.get(..detected_end);
         }
     }
     words.get(..end)
@@ -1103,19 +1120,18 @@ pub fn detect_map_with<'a>(
 ) -> Option<&'a [u32]> {
     let map = MapView::new(words)?;
     let end = map.total_words();
-    let base_end = unsafe { words.as_ptr().add(end) };
     for index in (0..map.len()).rev() {
         let pair = map.expect_pair(index);
         let detected = detect_value(pair.value())?;
-        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
-            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
-            return words.get(..offset.checked_add(detected.len())?);
+        let detected_end = checked_slice_end(words, detected)?;
+        if detected_end > end {
+            return words.get(..detected_end);
         }
 
         let detected = detect_key(pair.key())?;
-        if unsafe { detected.as_ptr().add(detected.len()) } > base_end {
-            let offset = unsafe { detected.as_ptr().offset_from(words.as_ptr()) as usize };
-            return words.get(..offset.checked_add(detected.len())?);
+        let detected_end = checked_slice_end(words, detected)?;
+        if detected_end > end {
+            return words.get(..detected_end);
         }
     }
     words.get(..end)

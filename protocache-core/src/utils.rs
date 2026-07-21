@@ -279,7 +279,9 @@ pub fn compress_into(src: &[u8], out: &mut Vec<u8>) {
         let a_start = pos;
         let a = pick_run(src, &mut pos);
         if pos == src.len() {
-            unsafe { dst.add(off).write(a); }
+            unsafe {
+                dst.add(off).write(a);
+            }
             off += 1;
             if (a & 0x8) == 0 {
                 off = emit_run_raw(src, a_start, pos, dst, off);
@@ -288,7 +290,9 @@ pub fn compress_into(src: &[u8], out: &mut Vec<u8>) {
         }
         let b_start = pos;
         let b = pick_run(src, &mut pos);
-        unsafe { dst.add(off).write(a | (b << 4)); }
+        unsafe {
+            dst.add(off).write(a | (b << 4));
+        }
         off += 1;
         if (a & 0x8) == 0 {
             off = emit_run_raw(src, a_start, b_start, dst, off);
@@ -298,7 +302,9 @@ pub fn compress_into(src: &[u8], out: &mut Vec<u8>) {
         }
     }
 
-    unsafe { out.set_len(base + off); }
+    unsafe {
+        out.set_len(base + off);
+    }
 }
 
 pub fn decompress(src: &[u8]) -> Result<Vec<u8>, ReadError> {

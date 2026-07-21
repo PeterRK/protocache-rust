@@ -1,12 +1,26 @@
 [package]
 name = "protocache-extension"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Schema, reflection, and Protobuf conversion support for ProtoCache"
+keywords = ["protobuf", "serialization", "reflection", "schema"]
+categories = ["encoding", "parser-implementations"]
+
+[features]
+default = []
+native-proto = []
 
 [dependencies]
 prost = "0.13.5"
 prost-reflect = { version = "0.15.0", features = ["serde"] }
 prost-types = "0.13.5"
 serde_json = "1.0.145"
+protocache-core = { version = "0.1.0", path = "../protocache-core" }
+
+[dev-dependencies]
 tempfile = "3.27.0"
-protocache-core = { path = "../protocache-core" }

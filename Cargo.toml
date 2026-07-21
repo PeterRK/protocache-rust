@@ -6,3 +6,12 @@ members = [
     "protocache-test",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+authors = ["Ruan Kunliang <PeterRK@126.com>"]
+license = "BSD-3-Clause"
+repository = "https://github.com/PeterRK/protocache-rust"
+readme = "README.md"

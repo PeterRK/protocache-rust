@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::HashMap;
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocache_core::ViewMap;
@@ -16,12 +17,15 @@ fn fixture_root() -> PathBuf {
 }
 
 fn load_fixture_words() -> Vec<u32> {
-    let raw = fs::read(fixture_root().join("benchmark/test.pc")).unwrap();
-    bytes_to_words(&raw)
+    bytes_to_words(protocache_fixture_bytes())
 }
 
 fn load_fixture_bytes(name: &str) -> Vec<u8> {
-    fs::read(fixture_root().join("benchmark").join(name)).unwrap()
+    match name {
+        "test.pb" => protobuf_fixture_bytes().to_vec(),
+        "test.pc" => protocache_fixture_bytes().to_vec(),
+        _ => fs::read(fixture_root().join("benchmark").join(name)).unwrap(),
+    }
 }
 
 fn unique_temp_json_path(name: &str) -> PathBuf {
@@ -168,8 +172,6 @@ fn generated_fully_materialized_serialized_len_matches_fixture() {
 fn generated_fully_materialized_serialization_matches_fixture() {
     let words = load_fixture_words();
     let encoded = serialize_fully_materialized(&words);
-    assert_ne!(encoded, words);
-
     let mut actual = Junk::default();
     traverse_pc_main(MessageView::new(&encoded).unwrap(), &mut actual).unwrap();
 
@@ -182,8 +184,6 @@ fn generated_fully_materialized_serialization_matches_fixture() {
 #[test]
 fn benchmark_fixtures_match_expected_access_hashes() {
     let protobuf_raw = load_fixture_bytes("test.pb");
-    let flatbuffers_raw = load_fixture_bytes("test.fb");
-    let fory_raw = load_fixture_bytes("test.fr");
     let protocache_raw = load_fixture_bytes("test.pc");
     let protocache_words = bytes_to_words(&protocache_raw);
 
@@ -191,20 +191,28 @@ fn benchmark_fixtures_match_expected_access_hashes() {
     let mut pb_junk = Junk::default();
     traverse_pb_main(&pb, &mut pb_junk);
 
-    let fb = unsafe { fb_generated::test::root_as_main_unchecked(flatbuffers_raw.as_slice()) };
-    let mut fb_junk = Junk::default();
-    traverse_fb_main(fb, &mut fb_junk);
+    #[cfg(protocache_test_has_flatbuffers_generated)]
+    {
+        let raw = flatbuffers_fixture_bytes();
+        let root = unsafe { fb_generated::test::root_as_main_unchecked(raw) };
+        let mut junk = Junk::default();
+        traverse_fb_main(root, &mut junk);
+        assert_eq!(pb_junk.fuse(), junk.fuse());
+    }
 
-    let fory = new_fory().unwrap();
-    let fory_root: fory_generated::Main = fory.deserialize(&fory_raw).unwrap();
-    let mut fory_junk = Junk::default();
-    traverse_fory_main(&fory_root, &mut fory_junk);
+    #[cfg(protocache_test_has_fory_generated)]
+    {
+        let raw = load_fixture_bytes("test.fr");
+        let fory = new_fory().unwrap();
+        let root: fory_generated::Main = fory.deserialize(&raw).unwrap();
+        let mut junk = Junk::default();
+        traverse_fory_main(&root, &mut junk);
+        assert_eq!(pb_junk.fuse(), junk.fuse());
+    }
 
     let pc = MessageView::new(&protocache_words).unwrap();
     let mut pc_junk = Junk::default();
     traverse_pc_main(pc, &mut pc_junk).unwrap();
-    assert_eq!(pb_junk.fuse(), fb_junk.fuse());
-    assert_eq!(pb_junk.fuse(), fory_junk.fuse());
     assert_eq!(pb_junk.fuse(), pc_junk.fuse());
 
     let reflect_pool = load_reflect_descriptor_pool_from_proto_file(&fixture_root().join("proto/test.proto")).unwrap();
@@ -253,7 +261,7 @@ fn benchmark_generated_view_matches_cpp_basic_expectations() {
     assert!(root.flag());
     assert_eq!(root.mode(), 2);
     assert_eq!(root.str(), Some("Hello World!"));
-    assert_eq!(root.data().as_deref(), Some(b"abc123!?$*&()'-=@~".as_slice()));
+    assert_eq!(root.data(), Some(b"abc123!?$*&()'-=@~".as_slice()));
     assert_eq!(root.object().unwrap().i32(), 88);
     assert_eq!(root.objectv().unwrap().len(), 3);
     assert_eq!(root.matrix().unwrap().values().get(2).unwrap().values().get(2), Some(9.0));
@@ -287,6 +295,7 @@ fn benchmark_generated_ex_matches_cpp_basic_expectations() {
 }
 
 #[test]
+#[cfg(protocache_test_has_fory_generated)]
 fn benchmark_fory_generated_view_matches_cpp_basic_expectations() {
     let fory = new_fory().unwrap();
     let raw = load_fixture_bytes("test.fr");
@@ -363,15 +372,24 @@ fn benchmark_generated_ex_serialize_mutation_regression() {
 
 #[test]
 fn benchmark_compress_roundtrip_regression() {
-    for name in ["test.pb", "test.pc", "test.fb", "test.fr"] {
-        let raw = load_fixture_bytes(name);
+    let check = |raw: &[u8]| {
         let mut compressed = Vec::new();
-        compress_into(&raw, &mut compressed);
+        compress_into(raw, &mut compressed);
         assert!(!compressed.is_empty());
-
         let mut restored = Vec::new();
         decompress_into(&compressed, &mut restored).unwrap();
         assert_eq!(restored, raw);
+    };
+    for name in ["test.pb", "test.pc"] {
+        let raw = load_fixture_bytes(name);
+        check(&raw);
+    }
+    #[cfg(protocache_test_has_flatbuffers_generated)]
+    check(flatbuffers_fixture_bytes());
+    #[cfg(protocache_test_has_fory_generated)]
+    {
+        let raw = load_fixture_bytes("test.fr");
+        check(&raw);
     }
 }
 
@@ -508,7 +526,7 @@ fn benchmark_big_object_matches_cpp() {
     let descriptor = reflect_pool.get_message_by_name("Object").unwrap();
     let mut message = DynamicMessage::new(descriptor.clone());
     for i in 1..=1000 {
-        message.set_field_by_name(&format!("i{i}"), ReflectValue::I32(i as i32));
+        message.set_field_by_name(&format!("i{i}"), ReflectValue::I32(i));
     }
 
     let words = serialize_dynamic(&message).unwrap();

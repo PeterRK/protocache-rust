@@ -14,7 +14,7 @@ The workspace is organized into four crates:
 | Crate | Purpose |
 |:--|:--|
 | `protocache-core` | Protobuf-free runtime for zero-copy reads, mutable access, encoding, hashing, compression, and perfect-hash utilities |
-| `protocache-extension` | Schema loading, descriptor handling, reflection, protobuf/prost bridging, and schema-aware helpers |
+| `protocache-extension` | Descriptor handling, reflection, protobuf/prost bridging, schema-aware helpers, and optional native `.proto` parsing |
 | `protoc-gen-pcrs` | `protoc` plugin that generates typed Rust APIs |
 | `protocache-test` | Compatibility tests and the local benchmark harness |
 
@@ -60,25 +60,77 @@ Build the benchmark harness:
 cargo build --release -p protocache-test
 ```
 
-## Code Generation
-
-Generate typed Rust APIs with the plugin:
+`protocache-extension` builds as a pure Rust crate by default. To enable direct
+`.proto` source parsing through the native `libprotoc` bridge:
 
 ```bash
-cargo run -p protoc-gen-pcrs -- < input.bin > output.bin
+cargo build -p protocache-extension --features native-proto
 ```
+
+The `native-proto` feature currently supports Unix targets and requires a C++17
+compiler (`CXX` may override `c++`), `ar`, and development installations of
+`libprotoc` and `libprotobuf` (on Ubuntu, install `libprotoc-dev` and
+`libprotobuf-dev`). The `protocache-test` harness enables this feature because
+its compatibility tests parse fixture schemas.
+
+The Protobuf and ProtoCache benchmark binaries (`test.pb` and `test.pc`) are
+derived at build time from `test.proto` and `test.json`. The FlatBuffers binary
+is likewise derived from `test.fbs` and `test-fb.json`. These generated binaries
+are written to Cargo's `OUT_DIR`; they are not source fixtures.
+
+## Quick Start
+
+Run the low-level encode and zero-copy read example:
+
+```bash
+cargo run -p protocache-core --example basic
+```
+
+## Code Generation
+
+Build the `protoc` plugin and generate typed readonly Rust APIs from the existing test schema:
+
+```bash
+cargo build -p protoc-gen-pcrs
+mkdir -p generated
+protoc \
+  --proto_path=tests/fixtures/proto \
+  --plugin=protoc-gen-pcrs=target/debug/protoc-gen-pcrs \
+  --pcrs_out=generated \
+  tests/fixtures/proto/test.proto
+```
+
+This writes `generated/test.pc.rs`. To also generate mutable APIs in
+`generated/test.pc-ex.rs`, pass the `extra` plugin parameter:
+
+```bash
+protoc \
+  --proto_path=tests/fixtures/proto \
+  --plugin=protoc-gen-pcrs=target/debug/protoc-gen-pcrs \
+  --pcrs_out=extra:generated \
+  tests/fixtures/proto/test.proto
+```
+
+## Supported Platforms
+
+The core runtime, extension, and code generator officially support 64-bit Rust
+targets. 32-bit targets are not tested and are outside the compatibility
+guarantee. The optional `native-proto` feature is additionally limited to Unix
+targets.
 
 ## Dependency Boundary
 
-The Rust implementation does not depend on any non-Rust source tree at build or runtime.
+The core runtime, code generator, and default `protocache-extension` build use
+Rust workspace crates and published Rust dependencies. Fixture reuse in tests
+and benchmarks is data reuse, not a runtime code dependency.
 
-- Rust crates depend only on workspace crates and published Rust dependencies.
-- Fixture reuse in tests and benchmarks is data reuse, not a runtime code dependency.
+Native `.proto` parsing is an explicit exception: enabling
+`protocache-extension/native-proto` compiles `src/proto_bridge.cc` and dynamically
+links `libprotoc`, `libprotobuf`, and the platform C++ runtime. Additional
+developer workflows use external tools:
 
-Some developer workflows still rely on external tools:
-
-- `protoc` for `.proto` parsing and code generation flows
-- `flatc` for the local benchmark harness
+- `protoc` for code generation and descriptor-set workflows
+- `flatc` and `foryc` for their optional local benchmark cases
 
 ## Notes
 
