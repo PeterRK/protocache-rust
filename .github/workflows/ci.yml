@@ -28,7 +28,6 @@ jobs:
           libprotobuf-dev
           libprotoc-dev
           protobuf-compiler
-          flatbuffers-compiler
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.89.0

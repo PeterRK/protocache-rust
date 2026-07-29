@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
+documentation = "https://docs.rs/protocache-extension"
 description = "Schema, reflection, and Protobuf conversion support for ProtoCache"
 keywords = ["protobuf", "serialization", "reflection", "schema"]
 categories = ["encoding", "parser-implementations"]

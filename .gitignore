@@ -1,4 +1,5 @@
 target/
+.codex
 *.rlib
 tests
 !tests/
@@ -20,3 +21,4 @@ tests/fixtures/benchmark/*
 !tests/fixtures/benchmark/test.fbs
 !tests/fixtures/benchmark/test-fb.json
 c++
+scripts/

@@ -9,10 +9,11 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-flatbuffers = "=2.1.2"
-fory = "=1.0.0"
-fory-core = "=1.0.0"
-fory-derive = "=1.0.0"
+# Benchmark-only dependencies. This crate is never published.
+flatbuffers = "=25.12.19"
+fory = "=1.4.0"
+fory-core = "=1.4.0"
+fory-derive = "=1.4.0"
 mimalloc = { version = "0.1", default-features = false }
 prost = "0.13.5"
 prost-reflect = "0.15.0"

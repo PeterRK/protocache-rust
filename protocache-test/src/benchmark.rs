@@ -1077,9 +1077,7 @@ fn traverse_fb_main(root: fb_generated::test::Main<'_>, junk: &mut Junk) {
     }
     if let Some(values) = root.flags() {
         for value in values.iter() {
-            junk.u32_sum = junk
-                .u32_sum
-                .wrapping_add(u32::from(*value));
+            junk.u32_sum = junk.u32_sum.wrapping_add(u32::from(value));
         }
     }
     if let Some(value) = root.str() {

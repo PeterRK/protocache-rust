@@ -229,6 +229,29 @@ fn try_generate_flatbuffers(
     out_dir: &std::path::Path,
     flatc: &std::path::Path,
 ) -> Result<(), String> {
+    const REQUIRED_FLATC_VERSION: &str = "25.12.19";
+
+    let output = Command::new(flatc)
+        .arg("--version")
+        .output()
+        .map_err(|err| format!("failed to launch {flatc:?}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{flatc:?} --version exited with status {}",
+            output.status
+        ));
+    }
+    let version_output = String::from_utf8_lossy(&output.stdout);
+    let actual_version = version_output
+        .split_whitespace()
+        .last()
+        .ok_or_else(|| format!("{flatc:?} returned an empty version"))?;
+    if actual_version != REQUIRED_FLATC_VERSION {
+        return Err(format!(
+            "{flatc:?} version {actual_version} is incompatible; expected {REQUIRED_FLATC_VERSION}"
+        ));
+    }
+
     let source_path = fixture_root.join("benchmark/test.fbs");
     let json_path = fixture_root.join("benchmark/test-fb.json");
     for path in [&source_path, &json_path] {

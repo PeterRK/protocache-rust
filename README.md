@@ -2,10 +2,18 @@
 
 Rust implementation of ProtoCache, including the core runtime, mutable APIs, schema/reflection extensions, and a `protoc` code generator for typed Rust bindings.
 
-> Warning
+> [!WARNING]
 >
 > This Rust workspace was generated with AI assistance.
 > Treat it as generated software and verify behavior with tests and benchmarks before relying on it in production.
+
+## Release Status
+
+The `0.1.x` series is a beta-quality release. The wire-format compatibility,
+core read/write paths, reflection layer, and code generator are covered by the
+workspace compatibility suite, but the public Rust API may still change before
+`1.0`. Processing hostile inputs has not yet received production-level fuzzing
+and Miri coverage.
 
 ## Overview
 
@@ -17,6 +25,40 @@ The workspace is organized into four crates:
 | `protocache-extension` | Descriptor handling, reflection, protobuf/prost bridging, schema-aware helpers, and optional native `.proto` parsing |
 | `protoc-gen-pcrs` | `protoc` plugin that generates typed Rust APIs |
 | `protocache-test` | Compatibility tests and the local benchmark harness |
+
+The portable schema subset is documented in the upstream
+[schema reference](https://github.com/PeterRK/ProtoCache/blob/main/schema.md),
+and the binary layout is documented in the upstream
+[data-format reference](https://github.com/PeterRK/ProtoCache/blob/main/data-format.md).
+
+## Installation
+
+Add the protobuf-free runtime:
+
+```bash
+cargo add protocache-core@0.1.0
+```
+
+Add schema, reflection, JSON, and Protobuf conversion support when needed:
+
+```bash
+cargo add protocache-extension@0.1.0
+```
+
+Install the `protoc` plugin:
+
+```bash
+cargo install protoc-gen-pcrs --version 0.1.0
+```
+
+Equivalent manifest dependencies are:
+
+```toml
+[dependencies]
+protocache-core = "0.1.0"
+# Optional, for reflection and Protobuf-facing workflows:
+protocache-extension = "0.1.0"
+```
 
 The primary Rust-facing API layers are:
 
@@ -141,3 +183,16 @@ For most integrations:
 - add `protocache-extension` only when you need schema loading, reflection, or protobuf/prost conversion
 
 Most users should not need to work with descriptor wiring or dynamic reflection types directly unless they are building schema-driven tooling.
+
+## Security and Compatibility
+
+- The supported MSRV is Rust `1.89`.
+- Official support is limited to 64-bit targets.
+- `protocache-extension` is pure Rust by default; `native-proto` adds a
+  Unix-only C++/libprotoc FFI boundary.
+- The repository test/benchmark crate is not published. Its pinned
+  FlatBuffers and Fory dependencies are used only with checked-in,
+  locally-generated benchmark fixtures and are not dependencies of the three
+  public crates.
+- Report suspected security issues privately to the maintainer using the
+  contact address in the crate metadata.
