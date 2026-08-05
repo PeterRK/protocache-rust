@@ -15,6 +15,7 @@ use crate::{
 };
 
 #[derive(Debug)]
+/// Error returned while decoding or serializing a generated mutable message.
 pub enum MutableError {
     InvalidRoot {
         descriptor: String,
@@ -69,6 +70,7 @@ impl std::fmt::Display for MutableError {
 impl std::error::Error for MutableError {}
 
 #[derive(Clone, Copy)]
+/// The wire-level key representation used by a mutable map.
 pub enum MutableMapKeyKind {
     String,
     I32,
@@ -77,6 +79,10 @@ pub enum MutableMapKeyKind {
     U64,
 }
 
+/// Encoding and dirty-tracking contract implemented by mutable field values.
+///
+/// This trait is primarily implemented by generated bindings. Application code
+/// normally interacts with the generated field accessors instead.
 pub trait MutableField<'a>: Clone + Default {
     fn decode(field: FieldView<'a>) -> Option<Self>;
     fn detect(field: FieldView<'a>) -> Option<&'a [u32]>;
@@ -104,6 +110,7 @@ pub trait MutableField<'a>: Clone + Default {
     fn encode(&self, buffer: &mut Buffer) -> Result<Unit, MutableError>;
 }
 
+/// Array-specific extension of [`MutableField`] used by generated bindings.
 pub trait MutableArrayElement<'a>: MutableField<'a> {
     fn decode_array(words: &'a [u32]) -> Option<Vec<Self>>;
     fn detect_array_words(words: &'a [u32]) -> Option<&'a [u32]> {
@@ -115,6 +122,7 @@ pub trait MutableArrayElement<'a>: MutableField<'a> {
     fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError>;
 }
 
+/// Map-key encoding contract used by [`MutableMap`].
 pub trait MutableMapKey<'a>: Clone + Eq + Hash {
     fn decode_key(field: FieldView<'a>) -> Option<Self>;
     fn detect_key(field: FieldView<'a>) -> Option<&'a [u32]>;
@@ -142,6 +150,7 @@ impl AsRef<[u8]> for KeyBytes<'_> {
 }
 
 #[derive(Clone, Debug)]
+/// An owned mutable array with dirty tracking for generated messages.
 pub struct MutableArray<'a, T> {
     values: Vec<T>,
     dirty: bool,
@@ -159,6 +168,7 @@ impl<'a, T> Default for MutableArray<'a, T> {
 }
 
 impl<'a, T> MutableArray<'a, T> {
+    /// Creates an empty, clean mutable array.
     pub fn new() -> Self {
         Self::default()
     }
@@ -171,6 +181,7 @@ impl<'a, T> MutableArray<'a, T> {
         self.values.is_empty()
     }
 
+    /// Removes all values and marks the array dirty.
     pub fn clear(&mut self) {
         self.dirty = true;
         self.values.clear();
@@ -180,6 +191,7 @@ impl<'a, T> MutableArray<'a, T> {
         self.values.reserve(additional);
     }
 
+    /// Appends a value and marks the array dirty.
     pub fn push(&mut self, value: T) {
         self.dirty = true;
         self.values.push(value);
@@ -266,6 +278,7 @@ impl<'a, T> std::ops::IndexMut<usize> for MutableArray<'a, T> {
 }
 
 impl<'a, T: MutableArrayElement<'a>> MutableArray<'a, T> {
+    /// Decodes all elements from an encoded array.
     pub fn from_words(words: &'a [u32]) -> Option<Self> {
         Some(Self {
             values: T::decode_array(words)?,
@@ -274,12 +287,14 @@ impl<'a, T: MutableArrayElement<'a>> MutableArray<'a, T> {
         })
     }
 
+    /// Encodes the array into `buffer` and returns its field representation.
     pub fn encode_to_unit(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
         T::encode_array(&self.values, buffer)
     }
 }
 
 #[derive(Clone, Debug)]
+/// An owned mutable map with dirty tracking and ProtoCache key encoding.
 pub struct MutableMap<'a, K, V> {
     entries: HashMap<K, V>,
     dirty: bool,
@@ -297,6 +312,7 @@ impl<'a, K, V> Default for MutableMap<'a, K, V> {
 }
 
 impl<'a, K: Eq + Hash, V> MutableMap<'a, K, V> {
+    /// Creates an empty, clean mutable map.
     pub fn new() -> Self {
         Self::default()
     }
@@ -309,6 +325,7 @@ impl<'a, K: Eq + Hash, V> MutableMap<'a, K, V> {
         self.entries.is_empty()
     }
 
+    /// Removes all entries and marks the map dirty.
     pub fn clear(&mut self) {
         self.dirty = true;
         self.entries.clear();
@@ -318,6 +335,7 @@ impl<'a, K: Eq + Hash, V> MutableMap<'a, K, V> {
         self.entries.reserve(additional);
     }
 
+    /// Inserts an entry and marks the map dirty.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.dirty = true;
         self.entries.insert(key, value)
@@ -339,6 +357,7 @@ impl<'a, K: Eq + Hash, V> MutableMap<'a, K, V> {
         self.entries.get(key)
     }
 
+    /// Returns mutable access to a value and marks the map dirty when found.
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
@@ -409,6 +428,7 @@ impl<'b, 'a, K, V> IntoIterator for &'b mut MutableMap<'a, K, V> {
 }
 
 impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
+    /// Decodes all entries from an encoded map.
     pub fn from_words(words: &'a [u32]) -> Option<Self> {
         let map = MapView::new(words)?;
         let mut entries = HashMap::with_capacity(map.len());
@@ -422,6 +442,7 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
         })
     }
 
+    /// Encodes the map and its perfect-hash index into `buffer`.
     pub fn encode_to_unit(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
         let last = buffer.len();
         let mut memo = Vec::with_capacity(self.entries.len());
@@ -515,6 +536,10 @@ fn detect_map_words<'a, K: MutableMapKey<'a>, V: MutableField<'a>>(
 }
 
 #[derive(Clone, Debug)]
+/// Lazy mutable state for a generated message.
+///
+/// `N` is the number of schema fields and `WORDS` is the generated bitset
+/// storage. Untouched fields continue to borrow their original encoded words.
 pub struct MutableMessage<'a, const N: usize, const WORDS: usize> {
     words: Option<&'a [u32]>,
     accessed: [u64; WORDS],
@@ -530,11 +555,13 @@ impl<'a, const N: usize, const WORDS: usize> Default for MutableMessage<'a, N, W
 }
 
 impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
+    /// Creates empty mutable state with no borrowed source message.
     pub fn new() -> Self {
         debug_assert_eq!(WORDS, N.div_ceil(64));
         Self::default()
     }
 
+    /// Creates lazy mutable state backed by a validated encoded message.
     pub fn from_words(words: &'a [u32]) -> Option<Self> {
         MessageView::layout(words)?;
         debug_assert_eq!(WORDS, N.div_ceil(64));
@@ -552,11 +579,13 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
     }
 
     #[inline(always)]
+    /// Returns whether a field exists in the source message or has been set.
     pub fn has_field(&self, id: usize) -> bool {
         self.field(id).is_some()
     }
 
     #[inline(always)]
+    /// Returns whether a generated accessor has materialized this field.
     pub fn was_accessed(&self, id: usize) -> bool {
         let word = id / 64;
         let bit = id % 64;
@@ -567,6 +596,7 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
         self.accessed.iter().any(|&word| word != 0)
     }
 
+    /// Returns the untouched source words, or `None` after any field access.
     pub fn clean_words(&self) -> Option<&[u32]> {
         if self.has_any_accessed() {
             None
@@ -575,6 +605,7 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
         }
     }
 
+    /// Lazily decodes a field into its generated storage slot.
     pub fn get_field<'b, T: MutableField<'a>>(&mut self, id: usize, slot: &'b mut T) -> &'b mut T {
         if !self.was_accessed(id) {
             let word = id / 64;
@@ -586,6 +617,7 @@ impl<'a, const N: usize, const WORDS: usize> MutableMessage<'a, N, WORDS> {
     }
 
     #[inline(always)]
+    /// Serializes one generated field, reusing untouched source words when safe.
     pub fn serialize_field<T: MutableField<'a>>(
         &self,
         id: usize,
@@ -634,6 +666,8 @@ fn drop_present_unit(buffer: &mut Buffer, unit: &mut Unit) {
 }
 
 #[inline(always)]
+/// Copies an already encoded field into `buffer`, optionally folding small data
+/// into the returned [`Unit`].
 pub fn copy_words(words: &[u32], buffer: &mut Buffer, fold: bool) -> Unit {
     if fold && words.len() < 4 {
         return Unit::inline(words);

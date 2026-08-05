@@ -2,18 +2,26 @@
 
 use core::mem;
 
+/// Borrowed encoded ProtoCache words.
 pub type Words<'a> = &'a [u32];
+/// Borrowed raw bytes.
 pub type Bytes<'a> = &'a [u8];
+/// Numeric protobuf enum representation used by generated bindings.
 pub type EnumValue = i32;
 
+/// Converts a byte length to the number of four-byte ProtoCache words.
 #[inline(always)]
 pub const fn word_size(size: usize) -> usize {
     size.div_ceil(4)
 }
 
+/// A fixed-width scalar that can be read from and written to little-endian words.
 pub trait Scalar: Copy + Sized {
+    /// Encoded width in `u32` words.
     const WIDTH: usize;
+    /// Decodes from exactly [`Self::WIDTH`] words.
     fn from_words(words: &[u32]) -> Option<Self>;
+    /// Encodes into exactly [`Self::WIDTH`] words.
     fn write_words(self, words: &mut [u32]) -> Option<()>;
 }
 
@@ -81,6 +89,7 @@ impl Scalar for bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Broad reason that encoded or compressed input could not be read.
 pub enum CorruptionKind {
     Truncated,
     InvalidHeader,
@@ -89,7 +98,9 @@ pub enum CorruptionKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Error returned when compressed input is malformed or incomplete.
 pub struct ReadError {
+    /// The detected corruption category.
     pub kind: CorruptionKind,
 }
 
@@ -108,17 +119,23 @@ impl core::fmt::Display for ReadError {
 impl std::error::Error for ReadError {}
 
 #[derive(Clone, Debug, Default)]
+/// Reusable reverse-growing word buffer used by ProtoCache encoders.
+///
+/// Encoders prepend data, so existing segment positions remain stable as the
+/// allocation grows. Call [`Self::clear`] to reuse allocated capacity.
 pub struct Buffer {
     data: Vec<u32>,
     off: usize,
 }
 
 impl Buffer {
+    /// Creates an empty buffer without an allocation.
     #[inline(always)]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Creates an empty buffer with capacity for at least `words` words.
     #[inline(always)]
     pub fn with_capacity_words(words: usize) -> Self {
         Self {
@@ -127,6 +144,7 @@ impl Buffer {
         }
     }
 
+    /// Removes active data while retaining allocated capacity.
     #[inline(always)]
     pub fn clear(&mut self) {
         self.off = self.data.len();
@@ -147,6 +165,7 @@ impl Buffer {
         self.len() == 0
     }
 
+    /// Returns the active encoded words.
     #[inline(always)]
     pub fn view(&self) -> &[u32] {
         &self.data[self.off..]
@@ -188,6 +207,7 @@ impl Buffer {
         }
     }
 
+    /// Prepends `delta` zero-initialized words and returns them for writing.
     #[inline(always)]
     pub fn expand(&mut self, delta: usize) -> &mut [u32] {
         if self.off < delta {
@@ -200,6 +220,11 @@ impl Buffer {
         unsafe { core::slice::from_raw_parts_mut(ptr, delta) }
     }
 
+    /// Discards `delta` words from the front of the active view.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `delta` is greater than [`Self::len`].
     #[inline(always)]
     pub fn shrink(&mut self, delta: usize) {
         assert!(delta <= self.len());
@@ -236,16 +261,19 @@ impl Buffer {
     }
 }
 
+/// Reads an entire file into memory.
 pub fn load_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
+/// Compresses bytes using ProtoCache's lightweight run encoding.
 pub fn compress(src: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     compress_into(src, &mut out);
     out
 }
 
+/// Compresses into `out`, clearing its previous contents while reusing capacity.
 pub fn compress_into(src: &[u8], out: &mut Vec<u8>) {
     if src.is_empty() {
         out.clear();
@@ -307,12 +335,16 @@ pub fn compress_into(src: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// Decompresses data produced by [`compress`].
 pub fn decompress(src: &[u8]) -> Result<Vec<u8>, ReadError> {
     let mut out = Vec::new();
     decompress_into(src, &mut out)?;
     Ok(out)
 }
 
+/// Decompresses into `out`, reusing its allocation.
+///
+/// Malformed input clears `out` before returning an error.
 pub fn decompress_into(src: &[u8], out: &mut Vec<u8>) -> Result<(), ReadError> {
     if src.is_empty() {
         out.clear();

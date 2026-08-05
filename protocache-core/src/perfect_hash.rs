@@ -6,6 +6,7 @@ use crate::hash::hash128;
 use crate::utils::{CorruptionKind, ReadError};
 
 #[derive(Clone, Copy, Debug)]
+/// Borrowed reader for a serialized ProtoCache perfect-hash index.
 pub struct PerfectHashView<'a> {
     data: &'a [u8],
     bitmap: &'a [u8],
@@ -17,6 +18,7 @@ pub struct PerfectHashView<'a> {
 }
 
 impl<'a> PerfectHashView<'a> {
+    /// Parses and bounds-checks an index from the beginning of `data`.
     #[inline(always)]
     pub fn new(data: &'a [u8]) -> Result<Self, ReadError> {
         let header = read_u32_le(data).ok_or(ReadError::new(CorruptionKind::Truncated))?;
@@ -58,11 +60,13 @@ impl<'a> PerfectHashView<'a> {
         })
     }
 
+    /// Returns the number of bytes occupied by the parsed index.
     #[inline(always)]
     pub fn data_size(&self) -> usize {
         self.data.len()
     }
 
+    /// Returns the number of indexed keys.
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
@@ -73,6 +77,10 @@ impl<'a> PerfectHashView<'a> {
         self.len == 0
     }
 
+    /// Returns the candidate storage position for `key`.
+    ///
+    /// The index stores no key bytes, so callers must compare the key stored at
+    /// the returned position before treating the lookup as a match.
     #[inline(always)]
     pub fn locate(&self, key: &[u8]) -> Option<usize> {
         if self.len == 0 {

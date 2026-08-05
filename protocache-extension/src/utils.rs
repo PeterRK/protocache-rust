@@ -17,6 +17,7 @@ pub use crate::proto::ProtoError;
 pub use crate::proto::parse_proto;
 
 #[derive(Debug)]
+/// Error returned by protobuf JSON file helpers.
 pub enum JsonError {
     Io(std::io::Error),
     Json(serde_json::Error),
@@ -52,6 +53,9 @@ impl std::error::Error for JsonError {
     }
 }
 
+/// Transcodes a concrete prost message into owned ProtoCache words.
+///
+/// `descriptor` must describe `M`; a mismatch is reported as [`MutableError`].
 pub fn serialize_prost<M: Message>(
     message: &M,
     descriptor: MessageDescriptor,
@@ -59,6 +63,9 @@ pub fn serialize_prost<M: Message>(
     crate::serialize::serialize_prost_message(message, descriptor)
 }
 
+/// Transcodes a prost message into a reusable ProtoCache [`Buffer`].
+///
+/// The returned words borrow `buffer` until it is mutated again.
 pub fn serialize_prost_into_buffer<'b, M: Message>(
     message: &M,
     descriptor: MessageDescriptor,
@@ -67,6 +74,7 @@ pub fn serialize_prost_into_buffer<'b, M: Message>(
     crate::serialize::serialize_prost_message_into_buffer(message, descriptor, buffer)
 }
 
+/// Alias for [`serialize_prost`] retained for compatibility.
 pub fn serialize<M: Message>(
     message: &M,
     descriptor: MessageDescriptor,
@@ -74,6 +82,7 @@ pub fn serialize<M: Message>(
     serialize_prost(message, descriptor)
 }
 
+/// Alias for [`serialize_prost_into_buffer`] retained for compatibility.
 pub fn serialize_into_buffer<'b, M: Message>(
     message: &M,
     descriptor: MessageDescriptor,
@@ -82,10 +91,12 @@ pub fn serialize_into_buffer<'b, M: Message>(
     serialize_prost_into_buffer(message, descriptor, buffer)
 }
 
+/// Serializes a reflected protobuf message into owned ProtoCache words.
 pub fn serialize_dynamic(message: &DynamicMessage) -> Result<Vec<u32>, MutableError> {
     crate::serialize::serialize_dynamic_message(message)
 }
 
+/// Serializes a reflected protobuf message into a reusable buffer.
 pub fn serialize_dynamic_into_buffer<'b>(
     message: &DynamicMessage,
     buffer: &'b mut Buffer,
@@ -93,6 +104,9 @@ pub fn serialize_dynamic_into_buffer<'b>(
     crate::serialize::serialize_dynamic_message_into_buffer(message, buffer)
 }
 
+/// Loads protobuf JSON from a UTF-8 file using `descriptor` for field typing.
+///
+/// Unknown JSON fields are ignored to match the existing extension behavior.
 pub fn load_json(
     path: impl AsRef<Path>,
     descriptor: MessageDescriptor,
@@ -108,6 +122,7 @@ pub fn load_json(
     Ok(message)
 }
 
+/// Writes a reflected protobuf message as pretty JSON using protobuf field names.
 pub fn dump_json(message: &impl ReflectMessage, path: impl AsRef<Path>) -> Result<(), JsonError> {
     let dynamic = message.transcode_to_dynamic();
     let file = fs::File::create(path)?;
@@ -122,6 +137,7 @@ pub fn dump_json(message: &impl ReflectMessage, path: impl AsRef<Path>) -> Resul
 }
 
 #[cfg(all(feature = "native-proto", target_family = "unix"))]
+/// Parses a `.proto` file through the optional Unix `libprotoc` bridge.
 pub fn parse_proto_file(path: impl AsRef<Path>) -> Result<FileDescriptorProto, ProtoError> {
     crate::proto::parse_proto_file(path)
 }

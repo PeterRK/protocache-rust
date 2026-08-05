@@ -21,6 +21,7 @@ pub(crate) fn build_descriptor_pool(
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Field kinds supported by the portable ProtoCache schema subset.
 pub enum FieldType {
     None = 0,
     Message,
@@ -38,25 +39,37 @@ pub enum FieldType {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Resolved schema metadata for one message field or alias element.
 pub struct Field {
+    /// Zero-based ProtoCache field id.
     pub id: usize,
+    /// Whether the value is repeated.
     pub repeated: bool,
+    /// Map key kind, or [`FieldType::None`] for non-map fields.
     pub key: FieldType,
+    /// Scalar or object value kind.
     pub value: FieldType,
+    /// Fully qualified message or enum name when the value references a type.
     pub value_type: String,
+    /// ProtoCache-specific uninterpreted options attached to the field.
     pub tags: HashMap<String, String>,
 }
 
 impl Field {
+    /// Returns whether this field is represented as a map.
     pub fn is_map(&self) -> bool {
         self.key != FieldType::None
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Resolved ProtoCache schema metadata for one protobuf message.
 pub struct Descriptor {
+    /// Alias element metadata, or an empty field for a regular message.
     pub alias: Field,
+    /// Non-deprecated fields indexed by their protobuf names.
     pub fields: HashMap<String, Field>,
+    /// ProtoCache-specific uninterpreted options attached to the message.
     pub tags: HashMap<String, String>,
 }
 
@@ -71,12 +84,14 @@ impl Default for Descriptor {
 }
 
 impl Descriptor {
+    /// Returns whether the message is a ProtoCache alias wrapper.
     pub fn is_alias(&self) -> bool {
         self.alias.value != FieldType::None
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Schema validation error produced while registering protobuf descriptors.
 pub enum RegisterError {
     DuplicateDescriptor {
         name: String,
@@ -118,6 +133,7 @@ pub enum RegisterError {
 }
 
 #[derive(Default)]
+/// Registry of validated ProtoCache message and enum descriptors.
 pub struct DescriptorPool {
     enums: HashSet<String>,
     enum_values: HashMap<String, BTreeMap<String, i32>>,
@@ -125,6 +141,10 @@ pub struct DescriptorPool {
 }
 
 impl DescriptorPool {
+    /// Registers all supported, non-deprecated definitions from a protobuf file.
+    ///
+    /// Registration resolves referenced message and enum types and rejects
+    /// shapes that cannot be represented by ProtoCache.
     pub fn register(&mut self, file: &FileDescriptorProto) -> Result<(), RegisterError> {
         let package = file.package();
         for item in &file.enum_type {
@@ -150,6 +170,7 @@ impl DescriptorPool {
         Ok(())
     }
 
+    /// Finds a message descriptor by fully qualified protobuf name.
     pub fn find(&self, full_name: &str) -> Option<&Descriptor> {
         self.descriptors.get(full_name)
     }

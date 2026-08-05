@@ -1,3 +1,5 @@
+//! Unix `libprotoc` bridge used by the optional `native-proto` feature.
+
 use std::ffi::CString;
 #[cfg(test)]
 use std::fs;
@@ -17,6 +19,7 @@ use prost_types::FileDescriptorProto;
 #[cfg(test)]
 use prost_types::FileDescriptorSet;
 #[derive(Debug)]
+/// Error returned while parsing `.proto` source or resolving its descriptors.
 pub enum ProtoError {
     Io(std::io::Error),
     ParseFailed { message: String },
@@ -74,6 +77,12 @@ impl std::error::Error for ProtoError {
     }
 }
 
+/// Parses one in-memory `.proto` source through `libprotoc`.
+///
+/// `file_name` supplies the logical name stored in the returned descriptor and
+/// is also used in parser diagnostics. Imports cannot be resolved by this
+/// single-source helper; use [`crate::utils::parse_proto_file`] for file-based
+/// parsing.
 pub fn parse_proto(source: &str, file_name: &str) -> Result<FileDescriptorProto, ProtoError> {
     let source_cstr = CString::new(source).map_err(|_| ProtoError::ParseFailed {
         message: "proto source contains interior NUL byte".to_owned(),
@@ -98,6 +107,7 @@ pub fn parse_proto(source: &str, file_name: &str) -> Result<FileDescriptorProto,
     FileDescriptorProto::decode(bytes.as_slice()).map_err(ProtoError::Decode)
 }
 
+/// Parses a `.proto` file through `libprotoc`, resolving imports from its path.
 pub fn parse_proto_file(path: impl AsRef<Path>) -> Result<FileDescriptorProto, ProtoError> {
     let path_cstr = path_to_cstring(path.as_ref())?;
     let bytes = unsafe {

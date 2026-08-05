@@ -6,8 +6,11 @@ use crate::Scalar;
 use crate::hash::hash128;
 
 #[derive(Clone, Copy, Debug, Default)]
+/// A contiguous range stored in a reverse-growing [`Buffer`].
 pub struct Segment {
+    /// Position measured from the end of the buffer.
     pub pos: usize,
+    /// Segment length in `u32` words.
     pub len: usize,
 }
 
@@ -19,6 +22,10 @@ impl Segment {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+/// Intermediate representation of an encoded field.
+///
+/// Values up to three words can remain inline; larger values refer to a
+/// [`Segment`] already written into a [`Buffer`].
 pub struct Unit {
     inline_len: usize,
     inline_data: [u32; 3],
@@ -435,11 +442,16 @@ fn fast_mod_u32(value: u32, divisor: u32, magic: u64) -> u32 {
 }
 
 #[inline(always)]
+/// Builds a ProtoCache perfect-hash index for unique encoded keys.
+///
+/// Returns `None` if no valid index can be constructed, including duplicate
+/// key layouts that cannot be represented.
 pub fn build_perfect_hash_index<K: AsRef<[u8]>>(keys: &[K]) -> Option<Vec<u8>> {
     Some(build_perfect_hash_index_with_positions(keys)?.0)
 }
 
 #[inline(always)]
+/// Builds a perfect-hash index and reports each input key's storage position.
 pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
     keys: &[K],
 ) -> Option<(Vec<u8>, Vec<usize>)> {
@@ -542,6 +554,7 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
 }
 
 #[inline(always)]
+/// Moves a small buffered segment into the inline storage of `unit` when possible.
 pub fn fold_field(buffer: &mut Buffer, unit: &mut Unit) {
     if !unit.is_segment() || unit.segment.len >= 4 || unit.segment.pos != buffer.len() {
         return;
@@ -555,6 +568,7 @@ pub fn fold_field(buffer: &mut Buffer, unit: &mut Unit) {
 }
 
 #[inline(always)]
+/// Encodes a scalar as an inline field unit.
 pub fn serialize_scalar<T: Scalar>(value: T) -> Unit {
     let mut words = [0u32; 3];
     let word_len = T::WIDTH;
@@ -569,11 +583,16 @@ pub fn serialize_scalar<T: Scalar>(value: T) -> Unit {
 }
 
 #[inline(always)]
+/// Encodes a boolean as an inline field unit.
 pub fn serialize_bool(value: bool) -> Unit {
     Unit::inline(&[u32::from(value)])
 }
 
 #[inline(always)]
+/// Encodes a byte string into `buffer`.
+///
+/// Short payloads may be returned inline. `None` indicates an encoded-size or
+/// offset overflow.
 pub fn serialize_bytes(bytes: &[u8], buffer: &mut Buffer) -> Option<Unit> {
     if bytes.len() >= (1usize << 30) {
         return None;
@@ -608,11 +627,14 @@ pub fn serialize_bytes(bytes: &[u8], buffer: &mut Buffer) -> Option<Unit> {
 }
 
 #[inline(always)]
+/// Encodes a UTF-8 string using the ProtoCache byte-string representation.
 pub fn serialize_str(value: &str, buffer: &mut Buffer) -> Option<Unit> {
     serialize_bytes(value.as_bytes(), buffer)
 }
 
 #[inline(always)]
+/// Encodes message fields, restricting referenced segments to data written
+/// since the caller-provided `last` buffer length.
 pub fn serialize_message_at(fields: &mut [Unit], buffer: &mut Buffer, last: usize) -> Option<Unit> {
     if fields.is_empty() {
         return None;
@@ -701,11 +723,13 @@ pub fn serialize_message_at(fields: &mut [Unit], buffer: &mut Buffer, last: usiz
 }
 
 #[inline(always)]
+/// Encodes a message from zero-based field units.
 pub fn serialize_message(fields: &mut [Unit], buffer: &mut Buffer) -> Option<Unit> {
     serialize_message_at(fields, buffer, buffer.len())
 }
 
 #[inline(always)]
+/// Encodes array elements written since `last`, updating their segment metadata.
 pub fn serialize_array_at_mut(
     elements: &mut [Unit],
     buffer: &mut Buffer,
@@ -733,6 +757,7 @@ pub fn serialize_array_at_mut(
 }
 
 #[inline(always)]
+/// Encodes array elements written since the caller-provided `last` length.
 pub fn serialize_array_at(elements: &[Unit], buffer: &mut Buffer, last: usize) -> Option<Unit> {
     if elements.is_empty() {
         return Some(Unit::inline(&[1]));
@@ -766,11 +791,13 @@ pub fn serialize_array_at(elements: &[Unit], buffer: &mut Buffer, last: usize) -
 }
 
 #[inline(always)]
+/// Encodes an array from element units.
 pub fn serialize_array(elements: &[Unit], buffer: &mut Buffer) -> Option<Unit> {
     serialize_array_at(elements, buffer, buffer.len())
 }
 
 #[inline(always)]
+/// Encodes map key/value units and their perfect-hash index from mutable inputs.
 pub fn serialize_map_at_mut(
     index: &[u8],
     keys: &mut [Unit],
@@ -852,6 +879,8 @@ pub(crate) fn serialize_map_pairs_at_mut(
 }
 
 #[inline(always)]
+/// Encodes map key/value units and their perfect-hash index using `last` as the
+/// boundary for referenced buffer segments.
 pub fn serialize_map_at(
     index: &[u8],
     keys: &[Unit],
@@ -916,6 +945,7 @@ pub fn serialize_map_at(
 }
 
 #[inline(always)]
+/// Encodes a map from canonical key bytes and key/value field units.
 pub fn serialize_map(
     index: &[u8],
     keys: &[Unit],

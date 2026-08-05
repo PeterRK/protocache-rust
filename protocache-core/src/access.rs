@@ -5,11 +5,15 @@ use core::marker::PhantomData;
 use crate::perfect_hash::PerfectHashView;
 use crate::utils::{Scalar, word_size};
 
+/// A scalar key that can be converted to the bytes used by a map index.
 pub trait MapKey {
+    /// Returns the key's canonical little-endian representation.
     fn as_key_bytes(&self) -> Vec<u8>;
 }
 
+/// Decodes a typed value from an encoded message, array, or map field.
 pub trait FieldDecode<'a>: Sized {
+    /// Returns `None` when the field does not have the expected shape.
     fn decode(field: FieldView<'a>) -> Option<Self>;
 }
 
@@ -34,11 +38,16 @@ macro_rules! impl_map_key {
 impl_map_key!(i32, u32, i64, u64);
 
 #[derive(Clone, Copy, Debug)]
+/// A borrowed ProtoCache byte string.
+///
+/// ProtoCache does not require string payloads to be UTF-8; use [`Self::as_str`]
+/// when text validation is required.
 pub struct StringView<'a> {
     bytes: &'a [u8],
 }
 
 impl<'a> StringView<'a> {
+    /// Parses a string/bytes object from the beginning of `words`.
     #[inline(always)]
     pub fn new(words: &'a [u32]) -> Option<Self> {
         let raw = bytes_of_words(words);
@@ -68,6 +77,7 @@ impl<'a> StringView<'a> {
         None
     }
 
+    /// Returns the encoded object length in words without constructing a view.
     #[inline(always)]
     pub fn detect_len(words: &'a [u32]) -> Option<usize> {
         let raw = bytes_of_words(words);
@@ -94,21 +104,25 @@ impl<'a> StringView<'a> {
         None
     }
 
+    /// Returns the exact encoded subslice occupied by the string/bytes object.
     #[inline(always)]
     pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {
         words.get(..Self::detect_len(words)?)
     }
 
+    /// Returns the payload without UTF-8 validation.
     #[inline(always)]
     pub fn as_bytes(self) -> &'a [u8] {
         self.bytes
     }
 
+    /// Returns the payload as text, or `None` if it is not valid UTF-8.
     #[inline(always)]
     pub fn as_str(self) -> Option<&'a str> {
         core::str::from_utf8(self.bytes).ok()
     }
 
+    /// Interprets every payload byte as one boolean value.
     #[inline(always)]
     pub fn as_bool_array(self) -> BoolArray<'a> {
         BoolArray { bytes: self.bytes }
@@ -131,6 +145,7 @@ impl<'a> core::fmt::Display for StringView<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// A borrowed sequence of booleans stored as ProtoCache bytes.
 pub struct BoolArray<'a> {
     bytes: &'a [u8],
 }
@@ -158,6 +173,10 @@ impl<'a> BoolArray<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// The encoded words and width metadata for one field.
+///
+/// Prefer the typed conversion methods (`scalar`, `string`, `message`,
+/// `array`, and `map`) unless implementing a generated accessor.
 pub struct FieldView<'a> {
     tail: &'a [u32],
     width: usize,
@@ -271,6 +290,7 @@ impl<'a> FieldView<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// A zero-copy view over an encoded ProtoCache message.
 pub struct MessageView<'a> {
     head: u32,
     words: &'a [u32],
@@ -286,6 +306,10 @@ pub(crate) struct MessageLayout {
 }
 
 impl<'a> MessageView<'a> {
+    /// Parses a message header from `words`.
+    ///
+    /// The view may borrow a larger enclosing slice; call [`Self::detect`] when
+    /// the exact encoded extent is needed.
     #[inline(always)]
     pub fn new(words: &'a [u32]) -> Option<Self> {
         let layout = Self::layout(words)?;
@@ -298,16 +322,19 @@ impl<'a> MessageView<'a> {
         })
     }
 
+    /// Alias for [`Self::new`] used by generated bindings.
     #[inline(always)]
     pub fn from_words(words: &'a [u32]) -> Option<Self> {
         Self::new(words)
     }
 
+    /// Returns the minimum message header/body slice retained by this view.
     #[inline(always)]
     pub fn raw_words(self) -> &'a [u32] {
         self.words
     }
 
+    /// Detects the complete encoded message length, including referenced data.
     #[inline(always)]
     pub fn detect_len(words: &'a [u32]) -> Option<usize> {
         let head = *words.first()?;
@@ -326,16 +353,19 @@ impl<'a> MessageView<'a> {
         Some(tail)
     }
 
+    /// Returns the exact encoded slice occupied by a valid message.
     #[inline(always)]
     pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {
         words.get(..Self::detect_len(words)?)
     }
 
+    /// Returns whether the message contains the field with zero-based `id`.
     #[inline(always)]
     pub fn has_field(self, id: usize) -> bool {
         self.field(id).is_some()
     }
 
+    /// Returns a raw field view for zero-based `id`.
     #[inline(always)]
     pub fn field(self, id: usize) -> Option<FieldView<'a>> {
         Self::field_in(
@@ -446,6 +476,7 @@ impl<'a> MessageView<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// A zero-copy view over an encoded ProtoCache array.
 pub struct ArrayView<'a> {
     body: &'a [u32],
     len: usize,
@@ -453,6 +484,7 @@ pub struct ArrayView<'a> {
 }
 
 impl<'a> ArrayView<'a> {
+    /// Parses an encoded array from `words`.
     #[inline(always)]
     pub fn new(words: &'a [u32]) -> Option<Self> {
         let head = *words.first()?;
@@ -466,6 +498,7 @@ impl<'a> ArrayView<'a> {
         Some(Self { body, len, width })
     }
 
+    /// Detects the complete encoded array length, including referenced items.
     #[inline(always)]
     pub fn detect_len(words: &'a [u32]) -> Option<usize> {
         let head = *words.first()?;
@@ -477,11 +510,13 @@ impl<'a> ArrayView<'a> {
         1usize.checked_add(len.checked_mul(width)?)
     }
 
+    /// Returns the exact encoded slice occupied by a valid array.
     #[inline(always)]
     pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {
         words.get(..Self::detect_len(words)?)
     }
 
+    /// Returns the number of array elements.
     #[inline(always)]
     pub fn len(self) -> usize {
         self.len
@@ -502,6 +537,7 @@ impl<'a> ArrayView<'a> {
         1 + self.len * self.width
     }
 
+    /// Returns a raw field view for the element at `index`.
     #[inline(always)]
     pub fn field(self, index: usize) -> Option<FieldView<'a>> {
         if index >= self.len {
@@ -554,6 +590,7 @@ impl<'a> ArrayView<'a> {
     }
 }
 
+/// Iterator over the raw fields of an [`ArrayView`].
 pub struct ArrayIter<'a> {
     array: ArrayView<'a>,
     index: usize,
@@ -579,6 +616,7 @@ impl<'a> Iterator for ArrayIter<'a> {
 impl ExactSizeIterator for ArrayIter<'_> {}
 impl core::iter::FusedIterator for ArrayIter<'_> {}
 
+/// A typed, zero-copy array facade built on [`ArrayView`].
 pub struct ViewArray<'a, T> {
     array: ArrayView<'a>,
     _marker: PhantomData<T>,
@@ -630,6 +668,7 @@ impl<'a, T: FieldDecode<'a>> ViewArray<'a, T> {
     }
 }
 
+/// Iterator over decoded values in a [`ViewArray`].
 pub struct ViewArrayIter<'a, T> {
     array: ViewArray<'a, T>,
     index: usize,
@@ -655,6 +694,7 @@ impl<'a, T: FieldDecode<'a>> Iterator for ViewArrayIter<'a, T> {
 impl<'a, T: FieldDecode<'a>> ExactSizeIterator for ViewArrayIter<'a, T> {}
 impl<'a, T: FieldDecode<'a>> core::iter::FusedIterator for ViewArrayIter<'a, T> {}
 
+/// A zero-copy view over a densely encoded array of scalar values.
 pub struct ScalarArray<'a, T> {
     words: &'a [u32],
     len: usize,
@@ -698,6 +738,7 @@ impl<'a, T: Scalar> ScalarArray<'a, T> {
     }
 }
 
+/// Iterator over scalar values in a [`ScalarArray`].
 pub struct ScalarArrayIter<'a, T> {
     array: ScalarArray<'a, T>,
     index: usize,
@@ -724,6 +765,7 @@ impl<T: Scalar> ExactSizeIterator for ScalarArrayIter<'_, T> {}
 impl<T: Scalar> core::iter::FusedIterator for ScalarArrayIter<'_, T> {}
 
 #[derive(Clone, Copy, Debug)]
+/// A borrowed key/value pair from a [`MapView`].
 pub struct PairView<'a> {
     tail: &'a [u32],
     key_width: usize,
@@ -749,6 +791,7 @@ impl<'a> PairView<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// A zero-copy view over an encoded ProtoCache map and its perfect-hash index.
 pub struct MapView<'a> {
     index: PerfectHashView<'a>,
     body: &'a [u32],
@@ -759,6 +802,7 @@ pub struct MapView<'a> {
 }
 
 impl<'a> MapView<'a> {
+    /// Parses an encoded map and validates its structural header.
     #[inline(always)]
     pub fn new(words: &'a [u32]) -> Option<Self> {
         let head = *words.first()?;
@@ -783,6 +827,7 @@ impl<'a> MapView<'a> {
         })
     }
 
+    /// Detects the complete encoded map length, including keys and values.
     #[inline(always)]
     pub fn detect_len(words: &'a [u32]) -> Option<usize> {
         let head = *words.first()?;
@@ -795,11 +840,13 @@ impl<'a> MapView<'a> {
         word_size(index.data_size()).checked_add(index.len().checked_mul(key_width + value_width)?)
     }
 
+    /// Returns the exact encoded slice occupied by a valid map.
     #[inline(always)]
     pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {
         words.get(..Self::detect_len(words)?)
     }
 
+    /// Returns the number of key/value pairs.
     #[inline(always)]
     pub fn len(self) -> usize {
         self.len
@@ -815,6 +862,7 @@ impl<'a> MapView<'a> {
         self.total_words
     }
 
+    /// Returns the raw pair stored at perfect-hash position `index`.
     #[inline(always)]
     pub fn pair(self, index: usize) -> Option<PairView<'a>> {
         if index >= self.len {
@@ -848,6 +896,7 @@ impl<'a> MapView<'a> {
         }
     }
 
+    /// Looks up an arbitrary byte-string key.
     #[inline(always)]
     pub fn find_bytes(self, key: &[u8]) -> Option<PairView<'a>> {
         let pos = self.index.locate(key)?;
@@ -859,11 +908,13 @@ impl<'a> MapView<'a> {
         }
     }
 
+    /// Looks up a UTF-8 key by its encoded bytes.
     #[inline(always)]
     pub fn find_str(self, key: &str) -> Option<PairView<'a>> {
         self.find_bytes(key.as_bytes())
     }
 
+    /// Looks up a scalar key using its canonical little-endian bytes.
     #[inline(always)]
     pub fn find_scalar<K: MapKey + Scalar + PartialEq>(self, key: K) -> Option<PairView<'a>> {
         let key_bytes = key.as_key_bytes();
@@ -877,6 +928,7 @@ impl<'a> MapView<'a> {
     }
 }
 
+/// Iterator over raw key/value pairs in a [`MapView`].
 pub struct MapIter<'a> {
     map: MapView<'a>,
     index: usize,
@@ -902,6 +954,7 @@ impl<'a> Iterator for MapIter<'a> {
 impl ExactSizeIterator for MapIter<'_> {}
 impl core::iter::FusedIterator for MapIter<'_> {}
 
+/// A typed, zero-copy map facade built on [`MapView`].
 pub struct ViewMap<'a, K, V> {
     map: MapView<'a>,
     _key: PhantomData<K>,
@@ -972,6 +1025,7 @@ impl<'a, K: FieldDecode<'a> + MapKey + Scalar + PartialEq, V: FieldDecode<'a>> V
     }
 }
 
+/// Iterator over decoded entries in a [`ViewMap`].
 pub struct ViewMapIter<'a, K, V> {
     map: ViewMap<'a, K, V>,
     index: usize,
@@ -1069,6 +1123,10 @@ impl<'a> FieldDecode<'a> for MapView<'a> {
 }
 
 #[inline(always)]
+/// Extends `end` to include a detected subslice after validating its provenance.
+///
+/// Returns `None` if `detected` is not word-aligned or not fully contained in
+/// `words`. This validation is required before composing safe detection APIs.
 pub fn detect_slice_end(words: &[u32], detected: &[u32], end: &mut usize) -> Option<()> {
     *end = (*end).max(checked_slice_end(words, detected)?);
     Some(())
@@ -1096,6 +1154,7 @@ pub(crate) fn checked_slice_end(words: &[u32], detected: &[u32]) -> Option<usize
 }
 
 #[inline(always)]
+/// Detects the complete encoded extent of an array using an element detector.
 pub fn detect_array_with<'a>(
     words: &'a [u32],
     mut detect: impl FnMut(FieldView<'a>) -> Option<&'a [u32]>,
@@ -1113,6 +1172,7 @@ pub fn detect_array_with<'a>(
 }
 
 #[inline(always)]
+/// Detects the complete encoded extent of a map using key and value detectors.
 pub fn detect_map_with<'a>(
     words: &'a [u32],
     mut detect_key: impl FnMut(FieldView<'a>) -> Option<&'a [u32]>,
