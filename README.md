@@ -78,8 +78,8 @@ with `--loops 1000000`. Timings are ns/op-equivalent local samples.
 | Decode + Traverse + Dealloc | 1825ns | **219ns** | 265ns | 1347ns |
 | Decode + Traverse(reflection) + Dealloc | 9628ns | **432ns** | - | - |
 | Compressed Size | **566B** | 571B | 856B | 611B |
-| Compress | **273ns** | 436ns | 817ns | 315ns |
-| Decompress | **117ns** | 271ns | 600ns | 154ns |
+| Compress | 273ns | 436ns | 817ns | 315ns |
+| Decompress | 117ns | 271ns | 600ns | 154ns |
 
 Mutable/serialize paths from the same Rust benchmark:
 

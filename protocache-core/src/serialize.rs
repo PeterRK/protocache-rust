@@ -1,5 +1,7 @@
 //! Serialization surface matching `serialize.h`.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 pub use crate::Buffer;
 
 use crate::Scalar;
@@ -285,6 +287,16 @@ struct Edge {
 }
 
 #[inline(always)]
+fn next_seed(state: &mut [u32; 4]) -> u32 {
+    let t = state[0] ^ (state[0] << 11);
+    state[0] = state[1];
+    state[1] = state[2];
+    state[2] = state[3];
+    state[3] ^= (state[3] >> 19) ^ t ^ (t >> 8);
+    state[3]
+}
+
+#[inline(always)]
 fn peel_graph(edges: &[Edge], slot_cnt: usize) -> Option<Vec<usize>> {
     const NONE: usize = usize::MAX;
 
@@ -469,8 +481,15 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
     let slot_cnt = section * 3;
     let bitmap_size = perfect_hash_bitmap_size(section);
 
-    let mut seed = 0u32;
-    let (edges, order) = loop {
+    let clock_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|error| error.duration())
+        .as_nanos() as u32;
+    let mut rand32 = [0x6c07_8965, 0x9908_b0df, 0x9d2c_5680, clock_seed];
+    let tries = if total <= u8::MAX as usize { 40 } else { 16 };
+    let mut result = None;
+    for _ in 0..tries {
+        let seed = next_seed(&mut rand32);
         let edges: Vec<_> = keys
             .iter()
             .map(|key| {
@@ -485,13 +504,11 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
             })
             .collect();
         if let Some(order) = peel_graph(&edges, slot_cnt) {
-            break (edges, order);
+            result = Some((seed, edges, order));
+            break;
         }
-        seed = seed.wrapping_add(1);
-        if seed == 0 {
-            return None;
-        }
-    };
+    }
+    let (seed, edges, order) = result?;
 
     let mut bitmap = vec![0xffu8; bitmap_size];
     let mut taken = vec![false; slot_cnt];
