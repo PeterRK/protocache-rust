@@ -444,6 +444,10 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
 
     /// Encodes the map and its perfect-hash index into `buffer`.
     pub fn encode_to_unit(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
+        if self.entries.is_empty() {
+            return Ok(Unit::inline(&[5u32 << 28]));
+        }
+
         let last = buffer.len();
         let mut memo = Vec::with_capacity(self.entries.len());
         let mut key_bytes = Vec::with_capacity(self.entries.len());
@@ -1222,6 +1226,32 @@ mod tests {
             row1.scalars::<f32>().unwrap().iter().collect::<Vec<_>>(),
             vec![7.0, 8.0, 9.0]
         );
+    }
+
+    #[test]
+    fn empty_mutable_map_encodes_as_inline_empty_map() {
+        let map = MutableMap::<String, i32>::new();
+        let mut buffer = Buffer::new();
+
+        let unit = map.encode_to_unit(&mut buffer).unwrap();
+
+        assert_eq!(unit.inline_words(), &[5u32 << 28]);
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(MapView::new(unit.inline_words()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn mutable_array_with_empty_map_element_roundtrips() {
+        let map = MutableMap::<String, i32>::new();
+        let maps = MutableArray::from(vec![map]);
+        let mut buffer = Buffer::new();
+
+        maps.encode_to_unit(&mut buffer).unwrap();
+
+        let array = ArrayView::new(buffer.view()).unwrap();
+        assert_eq!(array.len(), 1);
+        let map_words = array.field(0).unwrap().object_words().unwrap();
+        assert_eq!(MapView::new(map_words).unwrap().len(), 0);
     }
 
     #[test]
