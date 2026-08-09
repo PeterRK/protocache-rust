@@ -5,6 +5,16 @@ file. The project follows Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-09
+
+### Fixed
+
+- Bound perfect-hash construction retries so duplicate or otherwise
+  unrepresentable key sets return `None` instead of retrying across the full
+  seed space.
+- Encode an empty `MutableMap` as the canonical inline empty map instead of
+  panicking while initializing the entry-order table.
+
 ## [0.1.0] - 2026-07-28
 
 Initial beta release of the Rust ProtoCache implementation.
@@ -27,5 +37,6 @@ Initial beta release of the Rust ProtoCache implementation.
   compiler plus libprotoc/libprotobuf development libraries.
 - Production-level fuzzing and Miri coverage are not yet complete.
 
-[Unreleased]: https://github.com/PeterRK/protocache-rust/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/PeterRK/protocache-rust/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/PeterRK/protocache-rust/releases/tag/v0.1.1
 [0.1.0]: https://github.com/PeterRK/protocache-rust/releases/tag/v0.1.0

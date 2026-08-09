@@ -1094,6 +1094,13 @@ mod tests {
     }
 
     #[test]
+    fn index_builder_rejects_duplicate_keys() {
+        let keys = [b"duplicate".as_slice(), b"duplicate".as_slice()];
+        assert!(build_perfect_hash_index(&keys).is_none());
+        assert!(build_perfect_hash_index_with_positions(&keys).is_none());
+    }
+
+    #[test]
     fn serializes_short_string_key_float_array_map_roundtrip() {
         let keys_bytes = vec![b"lv5".to_vec(), b"lv9".to_vec()];
         let (index, positions) = build_perfect_hash_index_with_positions(&keys_bytes).unwrap();

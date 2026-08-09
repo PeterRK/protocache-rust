@@ -17,12 +17,12 @@ fory-derive = "=1.4.0"
 mimalloc = { version = "0.1", default-features = false }
 prost = "0.13.5"
 prost-reflect = "0.15.0"
-protocache-core = { version = "0.1.0", path = "../protocache-core" }
-protocache-extension = { version = "0.1.0", path = "../protocache-extension", features = ["native-proto"] }
+protocache-core = { version = "0.1.1", path = "../protocache-core" }
+protocache-extension = { version = "0.1.1", path = "../protocache-extension", features = ["native-proto"] }
 
 [build-dependencies]
 prost = "0.13.5"
 prost-build = "0.13.5"
 prost-reflect = { version = "0.15.0", features = ["serde"] }
 prost-types = "0.13.5"
-protocache-extension = { version = "0.1.0", path = "../protocache-extension" }
+protocache-extension = { version = "0.1.1", path = "../protocache-extension" }

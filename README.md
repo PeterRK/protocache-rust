@@ -36,28 +36,28 @@ and the binary layout is documented in the upstream
 Add the protobuf-free runtime:
 
 ```bash
-cargo add protocache-core@0.1.0
+cargo add protocache-core@0.1.1
 ```
 
 Add schema, reflection, JSON, and Protobuf conversion support when needed:
 
 ```bash
-cargo add protocache-extension@0.1.0
+cargo add protocache-extension@0.1.1
 ```
 
 Install the `protoc` plugin:
 
 ```bash
-cargo install protoc-gen-pcrs --version 0.1.0
+cargo install protoc-gen-pcrs --version 0.1.1
 ```
 
 Equivalent manifest dependencies are:
 
 ```toml
 [dependencies]
-protocache-core = "0.1.0"
+protocache-core = "0.1.1"
 # Optional, for reflection and Protobuf-facing workflows:
-protocache-extension = "0.1.0"
+protocache-extension = "0.1.1"
 ```
 
 The primary Rust-facing API layers are:

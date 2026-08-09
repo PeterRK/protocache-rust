@@ -15,8 +15,8 @@ categories = ["development-tools::build-utils", "encoding"]
 [dependencies]
 prost = "0.13.5"
 prost-types = "0.13.5"
-protocache-core = { version = "0.1.0", path = "../protocache-core" }
-protocache-extension = { version = "0.1.0", path = "../protocache-extension" }
+protocache-core = { version = "0.1.1", path = "../protocache-core" }
+protocache-extension = { version = "0.1.1", path = "../protocache-extension" }
 
 [dev-dependencies]
-protocache-extension = { version = "0.1.0", path = "../protocache-extension" }
+protocache-extension = { version = "0.1.1", path = "../protocache-extension" }
