@@ -21,4 +21,5 @@ tests/fixtures/benchmark/*
 !tests/fixtures/benchmark/test.fbs
 !tests/fixtures/benchmark/test-fb.json
 c++
-scripts/
+scripts/*
+!scripts/regenerate-test-bindings.py

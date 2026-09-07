@@ -328,13 +328,16 @@ impl<'a> MessageView<'a> {
         Self::new(words)
     }
 
-    /// Returns the minimum message header/body slice retained by this view.
+    /// Returns the original enclosing slice retained by this view.
     #[inline(always)]
     pub fn raw_words(self) -> &'a [u32] {
         self.words
     }
 
-    /// Detects the complete encoded message length, including referenced data.
+    /// Detects the message header and inline body length in words.
+    ///
+    /// Referenced child payloads are excluded. Use generated typed detection
+    /// when the complete recursive extent is required.
     #[inline(always)]
     pub fn detect_len(words: &'a [u32]) -> Option<usize> {
         let head = *words.first()?;
@@ -353,7 +356,7 @@ impl<'a> MessageView<'a> {
         Some(tail)
     }
 
-    /// Returns the exact encoded slice occupied by a valid message.
+    /// Returns the message header and inline body slice, excluding child payloads.
     #[inline(always)]
     pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {
         words.get(..Self::detect_len(words)?)
@@ -498,7 +501,10 @@ impl<'a> ArrayView<'a> {
         Some(Self { body, len, width })
     }
 
-    /// Detects the complete encoded array length, including referenced items.
+    /// Computes the array header and cell length, excluding referenced payloads.
+    ///
+    /// The header must be present; use [`Self::detect`] to also check that all
+    /// cells fit in the supplied slice.
     #[inline(always)]
     pub fn detect_len(words: &'a [u32]) -> Option<usize> {
         let head = *words.first()?;
@@ -510,7 +516,7 @@ impl<'a> ArrayView<'a> {
         1usize.checked_add(len.checked_mul(width)?)
     }
 
-    /// Returns the exact encoded slice occupied by a valid array.
+    /// Returns the array header and cells, excluding referenced payloads.
     #[inline(always)]
     pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {
         words.get(..Self::detect_len(words)?)
@@ -827,7 +833,9 @@ impl<'a> MapView<'a> {
         })
     }
 
-    /// Detects the complete encoded map length, including keys and values.
+    /// Computes the index and key/value cell length, excluding referenced payloads.
+    ///
+    /// The index must be present; use [`Self::detect`] to also check cell bounds.
     #[inline(always)]
     pub fn detect_len(words: &'a [u32]) -> Option<usize> {
         let head = *words.first()?;
@@ -840,7 +848,7 @@ impl<'a> MapView<'a> {
         word_size(index.data_size()).checked_add(index.len().checked_mul(key_width + value_width)?)
     }
 
-    /// Returns the exact encoded slice occupied by a valid map.
+    /// Returns the map index and cells, excluding referenced key/value payloads.
     #[inline(always)]
     pub fn detect(words: &'a [u32]) -> Option<&'a [u32]> {
         words.get(..Self::detect_len(words)?)

@@ -454,21 +454,20 @@ dependencies = [
 
 [[package]]
 name = "protoc-gen-pcrs"
-version = "0.1.1"
+version = "1.0.0"
 dependencies = [
  "prost",
  "prost-types",
- "protocache-core",
  "protocache-extension",
 ]
 
 [[package]]
 name = "protocache-core"
-version = "0.1.1"
+version = "1.0.0"
 
 [[package]]
 name = "protocache-extension"
-version = "0.1.1"
+version = "1.0.0"
 dependencies = [
  "prost",
  "prost-reflect",
@@ -480,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "protocache-test"
-version = "0.1.1"
+version = "1.0.0"
 dependencies = [
  "flatbuffers",
  "fory",

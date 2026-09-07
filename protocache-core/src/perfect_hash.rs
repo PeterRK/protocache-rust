@@ -118,7 +118,7 @@ impl<'a> PerfectHashView<'a> {
 }
 
 #[inline(always)]
-fn perfect_hash_layout(len: usize) -> (usize, usize, usize, usize) {
+pub(crate) fn perfect_hash_layout(len: usize) -> (usize, usize, usize, usize) {
     let section = ((len * 105).saturating_add(255) / 256).max(10);
     let bitmap_size = ((section * 3 + 31) & !31) / 4;
     let table_width = if len > u16::MAX as usize {
@@ -167,18 +167,18 @@ fn bit2(vec: &[u8], pos: usize) -> Option<u32> {
 }
 
 #[inline(always)]
-fn fast_mod_magic(divisor: u32) -> u64 {
+pub(crate) fn fast_mod_magic(divisor: u32) -> u64 {
     u64::MAX / divisor as u64 + 1
 }
 
 #[inline(always)]
-fn fast_mod_u32(value: u32, divisor: u32, magic: u64) -> u32 {
+pub(crate) fn fast_mod_u32(value: u32, divisor: u32, magic: u64) -> u32 {
     let low = magic.wrapping_mul(value as u64);
     (((low as u128) * divisor as u128) >> 64) as u32
 }
 
 #[inline(always)]
-fn count_valid_slot(v: u64) -> usize {
+pub(crate) fn count_valid_slot(v: u64) -> usize {
     let invalid = ((v & 0x5555_5555_5555_5555) & (v >> 1)).count_ones() as usize;
     32 - invalid
 }

@@ -1,4 +1,11 @@
 //! Serialization surface matching `serialize.h`.
+//!
+//! Units passed to an encoder must describe valid values. Segment units must
+//! refer to live, non-overlapping data in the same Buffer. For `_at` functions,
+//! `last` is the buffer length saved before writing the child payloads; discard
+//! units after clearing or reusing their buffer. Invalid caller-constructed
+//! segment metadata may panic. A failed encoding is not transactional: discard
+//! its units and clear or rebuild the buffer before retrying.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6,6 +13,9 @@ pub use crate::Buffer;
 
 use crate::Scalar;
 use crate::hash::hash128;
+use crate::perfect_hash::{
+    PerfectHashView, count_valid_slot, fast_mod_magic, fast_mod_u32, perfect_hash_layout,
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 /// A contiguous range stored in a reverse-growing [`Buffer`].
@@ -177,95 +187,42 @@ fn mark_unit(unit: &Unit, buffer: &mut Buffer, width: usize) {
 }
 
 #[inline(always)]
-fn best_array_size(elements: &[Unit]) -> (usize, usize) {
-    let mut sizes = [0usize; 3];
-    for element in elements {
-        sizes[0] += 1;
-        sizes[1] += 2;
-        sizes[2] += 3;
-        let len = element.size();
-        if len <= 1 {
-            continue;
-        }
-        sizes[0] += len;
-        if len <= 2 {
-            continue;
-        }
-        sizes[1] += len;
-        if len <= 3 {
-            continue;
-        }
-        sizes[2] += len;
+fn add_unit_size(sizes: &mut [usize; 3], len: usize) {
+    for (i, size) in sizes.iter_mut().enumerate() {
+        let width = i + 1;
+        *size += width + if len > width { len } else { 0 };
     }
+}
 
-    let mut mode = 0usize;
-    for idx in 1..3 {
-        if sizes[idx] < sizes[mode] {
-            mode = idx;
+#[inline(always)]
+fn best_width(sizes: [usize; 3]) -> (usize, usize) {
+    let mut mode = 0;
+    for i in 1..3 {
+        if sizes[i] < sizes[mode] {
+            mode = i;
         }
     }
     (sizes[mode], mode + 1)
 }
 
 #[inline(always)]
+fn best_array_size(elements: &[Unit]) -> (usize, usize) {
+    let mut sizes = [0; 3];
+    for element in elements {
+        add_unit_size(&mut sizes, element.size());
+    }
+    best_width(sizes)
+}
+
+#[inline(always)]
 fn best_array_size_pairs(elements: &[(Unit, Unit)]) -> ((usize, usize), (usize, usize)) {
-    let mut key_sizes = [0usize; 3];
-    let mut value_sizes = [0usize; 3];
+    let mut keys = [0; 3];
+    let mut values = [0; 3];
     for (key, value) in elements {
-        for sizes in [&mut key_sizes, &mut value_sizes] {
-            sizes[0] += 1;
-            sizes[1] += 2;
-            sizes[2] += 3;
-        }
-
-        let key_len = key.size();
-        if key_len > 1 {
-            key_sizes[0] += key_len;
-            if key_len > 2 {
-                key_sizes[1] += key_len;
-                if key_len > 3 {
-                    key_sizes[2] += key_len;
-                }
-            }
-        }
-
-        let value_len = value.size();
-        if value_len > 1 {
-            value_sizes[0] += value_len;
-            if value_len > 2 {
-                value_sizes[1] += value_len;
-                if value_len > 3 {
-                    value_sizes[2] += value_len;
-                }
-            }
-        }
+        add_unit_size(&mut keys, key.size());
+        add_unit_size(&mut values, value.size());
     }
-
-    let mut key_mode = 0usize;
-    let mut value_mode = 0usize;
-    for idx in 1..3 {
-        if key_sizes[idx] < key_sizes[key_mode] {
-            key_mode = idx;
-        }
-        if value_sizes[idx] < value_sizes[value_mode] {
-            value_mode = idx;
-        }
-    }
-
-    (
-        (key_sizes[key_mode], key_mode + 1),
-        (value_sizes[value_mode], value_mode + 1),
-    )
-}
-
-#[inline(always)]
-fn perfect_hash_section(size: usize) -> usize {
-    ((size * 105).saturating_add(255) / 256).max(10)
-}
-
-#[inline(always)]
-fn perfect_hash_bitmap_size(section: usize) -> usize {
-    ((section * 3 + 31) & !31) / 4
+    (best_width(keys), best_width(values))
 }
 
 #[inline(always)]
@@ -391,66 +348,7 @@ fn count_valid_slots(bitmap: &[u8], block: usize) -> usize {
             .try_into()
             .expect("bitmap block must fit"),
     );
-    count_valid_slots_in_word(bits)
-}
-
-#[inline(always)]
-fn locate_in_perfect_hash(index: &[u8], key: &[u8]) -> Option<usize> {
-    let size = u32::from_le_bytes(index.get(..4)?.try_into().ok()?) as usize & 0x0fff_ffff;
-    if size < 2 {
-        return Some(0);
-    }
-    let section = perfect_hash_section(size);
-    let section_u32 = section as u32;
-    let section_magic = fast_mod_magic(section_u32);
-    let bitmap_size = perfect_hash_bitmap_size(section);
-    let bitmap = index.get(8..8 + bitmap_size)?;
-    let table = index.get(8 + bitmap_size..)?;
-    let seed = u32::from_le_bytes(index.get(4..8)?.try_into().ok()?) as u64;
-    let code = hash128(key, seed);
-    let slots = [
-        fast_mod_u32(code[0], section_u32, section_magic) as usize,
-        fast_mod_u32(code[1], section_u32, section_magic) as usize + section,
-        fast_mod_u32(code[2], section_u32, section_magic) as usize + section * 2,
-    ];
-    let m = get_bit2(bitmap, slots[0]) as usize
-        + get_bit2(bitmap, slots[1]) as usize
-        + get_bit2(bitmap, slots[2]) as usize;
-    let slot = slots[m % 3];
-    let block = slot >> 5;
-    let bit = slot & 31;
-
-    let off = if size > u16::MAX as usize {
-        u32::from_le_bytes(table.get(block * 4..block * 4 + 4)?.try_into().ok()?) as usize
-    } else if size > u8::MAX as usize {
-        u16::from_le_bytes(table.get(block * 2..block * 2 + 2)?.try_into().ok()?) as usize
-    } else if size > 24 {
-        *table.get(block)? as usize
-    } else {
-        0
-    };
-
-    let word_start = block * 8;
-    let bits = u64::from_le_bytes(bitmap.get(word_start..word_start + 8)?.try_into().ok()?);
-    let masked = bits | (u64::MAX << (bit << 1));
-    Some(off + count_valid_slots_in_word(masked))
-}
-
-#[inline(always)]
-fn count_valid_slots_in_word(bits: u64) -> usize {
-    let invalid = ((bits & 0x5555_5555_5555_5555) & (bits >> 1)).count_ones() as usize;
-    32 - invalid
-}
-
-#[inline(always)]
-fn fast_mod_magic(divisor: u32) -> u64 {
-    u64::MAX / divisor as u64 + 1
-}
-
-#[inline(always)]
-fn fast_mod_u32(value: u32, divisor: u32, magic: u64) -> u32 {
-    let low = magic.wrapping_mul(value as u64);
-    (((low as u128) * divisor as u128) >> 64) as u32
+    count_valid_slot(bits)
 }
 
 #[inline(always)]
@@ -464,6 +362,7 @@ pub fn build_perfect_hash_index<K: AsRef<[u8]>>(keys: &[K]) -> Option<Vec<u8>> {
 
 #[inline(always)]
 /// Builds a perfect-hash index and reports each input key's storage position.
+/// Tries at most 40 seeds, regardless of the number of keys.
 pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
     keys: &[K],
 ) -> Option<(Vec<u8>, Vec<usize>)> {
@@ -475,20 +374,18 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
         return Some(((total as u32).to_le_bytes().to_vec(), vec![0; total]));
     }
 
-    let section = perfect_hash_section(total);
+    let (section, bitmap_size, _, index_size) = perfect_hash_layout(total);
     let section_u32 = section as u32;
     let section_magic = fast_mod_magic(section_u32);
     let slot_cnt = section * 3;
-    let bitmap_size = perfect_hash_bitmap_size(section);
 
     let clock_seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|error| error.duration())
         .as_nanos() as u32;
     let mut rand32 = [0x6c07_8965, 0x9908_b0df, 0x9d2c_5680, clock_seed];
-    let tries = if total <= u8::MAX as usize { 40 } else { 16 };
     let mut result = None;
-    for _ in 0..tries {
+    for _ in 0..40 {
         let seed = next_seed(&mut rand32);
         let edges: Vec<_> = keys
             .iter()
@@ -537,7 +434,7 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
         set_bit2(&mut bitmap, chosen, chosen_val);
     }
 
-    let mut out = Vec::with_capacity(8 + bitmap_size + bitmap_size / 2);
+    let mut out = Vec::with_capacity(index_size);
     out.extend_from_slice(&(total as u32).to_le_bytes());
     out.extend_from_slice(&seed.to_le_bytes());
     out.extend_from_slice(&bitmap);
@@ -562,9 +459,10 @@ pub fn build_perfect_hash_index_with_positions<K: AsRef<[u8]>>(
         }
     }
 
+    let view = PerfectHashView::new(&out).ok()?;
     let mut positions = Vec::with_capacity(keys.len());
     for key in keys.iter() {
-        positions.push(locate_in_perfect_hash(&out, key.as_ref())?);
+        positions.push(view.locate(key.as_ref())?);
     }
 
     Some((out, positions))
@@ -747,6 +645,12 @@ pub fn serialize_message(fields: &mut [Unit], buffer: &mut Buffer) -> Option<Uni
 
 #[inline(always)]
 /// Encodes array elements written since `last`, updating their segment metadata.
+///
+/// Write child payloads in reverse element order, then pass units in logical
+/// element order. Inline values may have different widths, including values
+/// previously folded by [`fold_field`]. This function may repack such values
+/// through [`serialize_array_at`]. Units are consumed logically: rebuild them
+/// before a second encoding. See the [module contract](self).
 pub fn serialize_array_at_mut(
     elements: &mut [Unit],
     buffer: &mut Buffer,
@@ -759,6 +663,12 @@ pub fn serialize_array_at_mut(
     let (size, width) = best_array_size(elements);
     if size >= (1usize << 30) {
         return None;
+    }
+
+    // A folded inline value can be wider than the chosen cell. Repack it as
+    // a payload using the general encoder before mutating any segment metadata.
+    if elements.iter().any(|unit| unit.inline_len > width) {
+        return serialize_array_at(elements, buffer, last);
     }
 
     let mut tail = buffer.len().checked_sub(last)?;
@@ -814,7 +724,23 @@ pub fn serialize_array(elements: &[Unit], buffer: &mut Buffer) -> Option<Unit> {
 }
 
 #[inline(always)]
+fn put_map_index(index: &[u8], key_width: usize, value_width: usize, buffer: &mut Buffer) {
+    let index_words = index.len().div_ceil(4);
+    let head = buffer.expand(index_words);
+    head.fill(0);
+    let raw =
+        unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
+    raw[..index.len()].copy_from_slice(index);
+    head[0] |= (key_width as u32) << 30 | (value_width as u32) << 28;
+}
+
+#[inline(always)]
 /// Encodes map key/value units and their perfect-hash index from mutable inputs.
+///
+/// Arrange entries in perfect-hash position order. Write entries in reverse
+/// order, with each value before its key. The index must describe these keys.
+/// Folded inline values are supported through the general repacking path.
+/// Rebuild units before encoding again. See the [module contract](self).
 pub fn serialize_map_at_mut(
     index: &[u8],
     keys: &mut [Unit],
@@ -837,6 +763,12 @@ pub fn serialize_map_at_mut(
         return None;
     }
 
+    if keys.iter().any(|unit| unit.inline_len > key_width)
+        || values.iter().any(|unit| unit.inline_len > value_width)
+    {
+        return serialize_map_at(index, keys, values, buffer, last);
+    }
+
     let mut tail = buffer.len().checked_sub(last)?;
     for index in (0..keys.len()).rev() {
         pick_unit(&mut values[index], buffer, &mut tail, value_width);
@@ -848,12 +780,7 @@ pub fn serialize_map_at_mut(
         mark_unit(&keys[index], buffer, key_width);
     }
 
-    let head = buffer.expand(index_words);
-    head.fill(0);
-    let raw =
-        unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
-    raw[..index.len()].copy_from_slice(index);
-    head[0] |= (key_width as u32) << 30 | (value_width as u32) << 28;
+    put_map_index(index, key_width, value_width, buffer);
     Some(Unit::segment(last, buffer.len()))
 }
 
@@ -875,6 +802,14 @@ pub(crate) fn serialize_map_pairs_at_mut(
         return None;
     }
 
+    if pairs
+        .iter()
+        .any(|(key, value)| key.inline_len > key_width || value.inline_len > value_width)
+    {
+        let (keys, values): (Vec<_>, Vec<_>) = pairs.iter().copied().unzip();
+        return serialize_map_at(index, &keys, &values, buffer, last);
+    }
+
     let mut tail = buffer.len().checked_sub(last)?;
     for (key, value) in pairs.iter_mut().rev() {
         pick_unit(value, buffer, &mut tail, value_width);
@@ -886,18 +821,17 @@ pub(crate) fn serialize_map_pairs_at_mut(
         mark_unit(key, buffer, key_width);
     }
 
-    let head = buffer.expand(index_words);
-    head.fill(0);
-    let raw =
-        unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
-    raw[..index.len()].copy_from_slice(index);
-    head[0] |= (key_width as u32) << 30 | (value_width as u32) << 28;
+    put_map_index(index, key_width, value_width, buffer);
     Some(Unit::segment(last, buffer.len()))
 }
 
 #[inline(always)]
 /// Encodes map key/value units and their perfect-hash index using `last` as the
 /// boundary for referenced buffer segments.
+///
+/// `index` must be a valid perfect-hash index for exactly these keys, and the
+/// key/value arrays must be arranged in index position order. Child segments
+/// may be written in any order; they are copied before the output is rebuilt.
 pub fn serialize_map_at(
     index: &[u8],
     keys: &[Unit],
@@ -952,12 +886,7 @@ pub fn serialize_map_at(
     buffer.put_words(&payloads);
     buffer.put_words(&cells);
 
-    let head = buffer.expand(index_words);
-    head.fill(0);
-    let raw =
-        unsafe { core::slice::from_raw_parts_mut(head.as_mut_ptr().cast::<u8>(), index_words * 4) };
-    raw[..index.len()].copy_from_slice(index);
-    head[0] |= (key_width as u32) << 30 | (value_width as u32) << 28;
+    put_map_index(index, key_width, value_width, buffer);
     Some(Unit::segment(last, buffer.len()))
 }
 
@@ -980,6 +909,70 @@ mod tests {
         serialize_scalar, serialize_str,
     };
     use crate::{ArrayView, Buffer, MapView, MessageView, StringView, ViewArray};
+
+    fn folded_string(value: &str, buffer: &mut Buffer) -> Unit {
+        let mut unit = serialize_str(value, buffer).unwrap();
+        fold_field(buffer, &mut unit);
+        unit
+    }
+
+    #[test]
+    fn mutable_array_repackages_folded_strings_wider_than_cells() {
+        let expected = ["a", "b", "c", "d", "e", "f", "g", "hello", "123456789"];
+        let mut buffer = Buffer::new();
+        buffer.put(0xfeed);
+        let mut units: Vec<_> = expected
+            .iter()
+            .map(|s| folded_string(s, &mut buffer))
+            .collect();
+        assert_eq!(buffer.view(), &[0xfeed]);
+        super::serialize_array_at_mut(&mut units, &mut buffer, 1).unwrap();
+        let array = ArrayView::new(buffer.view()).unwrap();
+        assert_eq!(array.width(), 1);
+        for (i, value) in expected.iter().enumerate() {
+            assert_eq!(
+                array.field(i).unwrap().string().unwrap().as_str(),
+                Some(*value)
+            );
+        }
+        assert_eq!(buffer.view().last(), Some(&0xfeed));
+    }
+
+    #[test]
+    fn mutable_map_repackages_wide_folded_keys_and_values() {
+        let names = ["a", "b", "c", "d", "e", "f", "g", "hello", "123456789"];
+        let (index, positions) = build_perfect_hash_index_with_positions(&names).unwrap();
+        for pairs_path in [false, true] {
+            let mut buffer = Buffer::new();
+            buffer.put(0xfeed);
+            let mut keys = vec![Unit::empty(); names.len()];
+            let mut values = keys.clone();
+            for (i, &pos) in positions.iter().enumerate() {
+                keys[pos] = folded_string(names[i], &mut buffer);
+                values[pos] = folded_string(names[names.len() - 1 - i], &mut buffer);
+            }
+            if pairs_path {
+                let mut pairs: Vec<_> = keys.into_iter().zip(values).collect();
+                super::serialize_map_pairs_at_mut(&index, &mut pairs, &mut buffer, 1).unwrap();
+            } else {
+                super::serialize_map_at_mut(&index, &mut keys, &mut values, &mut buffer, 1)
+                    .unwrap();
+            }
+            let map = MapView::new(buffer.view()).unwrap();
+            for (i, name) in names.iter().enumerate() {
+                assert_eq!(
+                    map.find_str(name)
+                        .unwrap()
+                        .value()
+                        .string()
+                        .unwrap()
+                        .as_str(),
+                    Some(names[names.len() - 1 - i])
+                );
+            }
+            assert_eq!(buffer.view().last(), Some(&0xfeed));
+        }
+    }
 
     #[test]
     fn serializes_inline_string() {
@@ -1088,7 +1081,12 @@ mod tests {
         let index = build_perfect_hash_index(&keys).unwrap();
         let mut seen = std::collections::BTreeSet::new();
         for key in &keys {
-            seen.insert(super::locate_in_perfect_hash(&index, key).unwrap());
+            seen.insert(
+                crate::PerfectHashView::new(&index)
+                    .unwrap()
+                    .locate(key)
+                    .unwrap(),
+            );
         }
         assert_eq!(seen.len(), keys.len());
     }

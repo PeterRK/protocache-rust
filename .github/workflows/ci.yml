@@ -43,6 +43,12 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
+      - name: Build generator
+        run: cargo build -p protoc-gen-pcrs --locked
+
+      - name: Test freshly generated bindings
+        run: PROTOC_GEN_PCRS="$PWD/target/debug/protoc-gen-pcrs" cargo test -p protocache-test --locked
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

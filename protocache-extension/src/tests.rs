@@ -1,14 +1,18 @@
 use prost::Message;
-use prost_reflect::{DescriptorPool, DynamicMessage, MapKey as ReflectMapKey, Value as ReflectValue};
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, MapKey as ReflectMapKey, Value as ReflectValue,
+};
 use protocache_core::{MapView, MessageView};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 use crate::serialize::serialize_protobuf_bytes;
-use crate::utils::{dump_json, load_json, parse_proto, parse_proto_file, serialize_dynamic};
+use crate::utils::{
+    dump_json, load_json, parse_proto, parse_proto_file, serialize_dynamic,
+    serialize_dynamic_into_buffer, serialize_prost,
+};
 
 const BASIC_SCHEMA: &str = r#"
 syntax = "proto3";
@@ -91,11 +95,18 @@ fn serializes_dynamic_message_via_read_only_reflection() {
     root.set_field_by_name("object", ReflectValue::Message(object));
     root.set_field_by_name(
         "i32v",
-        ReflectValue::List(vec![ReflectValue::I32(1), ReflectValue::I32(2), ReflectValue::I32(3)]),
+        ReflectValue::List(vec![
+            ReflectValue::I32(1),
+            ReflectValue::I32(2),
+            ReflectValue::I32(3),
+        ]),
     );
     root.set_field_by_name(
         "index",
-        ReflectValue::Map(HashMap::from([(ReflectMapKey::String("k".to_owned()), ReflectValue::I32(9))])),
+        ReflectValue::Map(HashMap::from([(
+            ReflectMapKey::String("k".to_owned()),
+            ReflectValue::I32(9),
+        )])),
     );
 
     let words = serialize_dynamic(&root).unwrap();
@@ -123,6 +134,9 @@ fn protobuf_bytes_and_prost_entry_points_match() {
 
     let from_bytes = serialize_protobuf_bytes(descriptor.clone(), &bytes).unwrap();
     let from_message = serialize_dynamic(&root).unwrap();
+    let from_prost = serialize_prost(&root, descriptor).unwrap();
+    assert_eq!(from_prost, from_message);
+    assert_eq!(from_bytes, from_message);
 
     let bytes_view = MessageView::new(&from_bytes).unwrap();
     let message_view = MessageView::new(&from_message).unwrap();
@@ -168,11 +182,16 @@ fn serializes_alias_fields_without_mutable_runtime() {
     let words = serialize_dynamic(&root).unwrap();
     let view = MessageView::new(&words).unwrap();
     assert_eq!(view.field(27).unwrap().detect_array().unwrap().len(), 4);
-    assert_eq!(MapView::new(view.field(29).unwrap().detect_map().unwrap()).unwrap().len(), 1);
+    assert_eq!(
+        MapView::new(view.field(29).unwrap().detect_map().unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
-fn descriptor_lookup_uses_cached_schema_after_first_load() {
+fn serialization_reuses_buffer_after_message_changes() {
     let file = parse_proto(
         r#"
             syntax = "proto3";
@@ -184,35 +203,42 @@ fn descriptor_lookup_uses_cached_schema_after_first_load() {
         "inline.proto",
     )
     .unwrap();
-    let pool =
-        DescriptorPool::from_file_descriptor_set(prost_types::FileDescriptorSet { file: vec![file] })
-            .unwrap();
+    let pool = DescriptorPool::from_file_descriptor_set(prost_types::FileDescriptorSet {
+        file: vec![file],
+    })
+    .unwrap();
     let mut message = DynamicMessage::new(pool.get_message_by_name("demo.Root").unwrap());
     message.set_field_by_name("value", ReflectValue::I32(5));
 
-    let first = serialize_dynamic(&message).unwrap();
-    assert_eq!(MessageView::new(&first).unwrap().scalar::<i32>(0), Some(5));
-}
-
-fn unique_temp_json_path(name: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("pcrs-ext-{name}-{}-{nanos}.json", std::process::id()))
+    let mut buffer = protocache_core::Buffer::new();
+    let first = serialize_dynamic_into_buffer(&message, &mut buffer).unwrap();
+    assert_eq!(MessageView::new(first).unwrap().scalar::<i32>(0), Some(5));
+    let allocated = buffer.allocated_words();
+    message.set_field_by_name("value", ReflectValue::I32(8));
+    let second = serialize_dynamic_into_buffer(&message, &mut buffer).unwrap();
+    assert_eq!(MessageView::new(second).unwrap().scalar::<i32>(0), Some(8));
+    assert_eq!(buffer.allocated_words(), allocated);
+    message.clear_field_by_name("value");
+    assert_eq!(
+        serialize_dynamic_into_buffer(&message, &mut buffer).unwrap(),
+        &[0]
+    );
 }
 
 #[test]
 fn loads_and_dumps_json_via_reflection() {
-    let (_dir, schema) = write_test_schema_file(BASIC_SCHEMA);
+    let (dir, schema) = write_test_schema_file(BASIC_SCHEMA);
     let pool = load_reflect_descriptor_pool_from_proto_file(&schema).unwrap();
     let descriptor = pool.get_message_by_name("test.Main").unwrap();
-    let json_path = unique_temp_json_path("roundtrip");
+    let json_path = dir.path().join("roundtrip.json");
     fs::write(&json_path, "{\n  \"i32\": 9,\n  \"str\": \"hello\"\n}\n").unwrap();
 
     let message = load_json(&json_path, descriptor.clone()).unwrap();
     assert_eq!(message.get_field_by_name("i32").unwrap().as_i32(), Some(9));
-    assert_eq!(message.get_field_by_name("str").unwrap().as_str(), Some("hello"));
+    assert_eq!(
+        message.get_field_by_name("str").unwrap().as_str(),
+        Some("hello")
+    );
 
     dump_json(&message, &json_path).unwrap();
     let dumped = fs::read_to_string(&json_path).unwrap();

@@ -21,3 +21,6 @@ pub use protocache_core::MutableError;
 
 #[cfg(all(feature = "native-proto", not(target_family = "unix")))]
 compile_error!("the `native-proto` feature is currently supported only on Unix targets");
+
+#[cfg(all(test, feature = "native-proto", target_family = "unix"))]
+mod tests;

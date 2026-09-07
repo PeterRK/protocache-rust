@@ -1,6 +1,6 @@
 //! Schema reflection APIs matching `extension/reflection.h`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use prost_types::{
     DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorProto,
@@ -136,7 +136,6 @@ pub enum RegisterError {
 /// Registry of validated ProtoCache message and enum descriptors.
 pub struct DescriptorPool {
     enums: HashSet<String>,
-    enum_values: HashMap<String, BTreeMap<String, i32>>,
     descriptors: HashMap<String, Descriptor>,
 }
 
@@ -145,13 +144,15 @@ impl DescriptorPool {
     ///
     /// Registration resolves referenced message and enum types and rejects
     /// shapes that cannot be represented by ProtoCache.
+    ///
+    /// Registration is not transactional. If it fails, discard the pool rather
+    /// than relying on partially registered definitions.
     pub fn register(&mut self, file: &FileDescriptorProto) -> Result<(), RegisterError> {
         let package = file.package();
         for item in &file.enum_type {
             if !is_deprecated_enum(item) {
                 let name = full_name(package, item.name());
-                self.enums.insert(name.clone());
-                self.enum_values.insert(name, collect_enum_values(item));
+                self.enums.insert(name);
             }
         }
         for message in &file.message_type {
@@ -175,11 +176,6 @@ impl DescriptorPool {
         self.descriptors.get(full_name)
     }
 
-    #[cfg(test)]
-    pub fn find_enum_number(&self, enum_name: &str, variant: &str) -> Option<i32> {
-        self.enum_values.get(enum_name)?.get(variant).copied()
-    }
-
     fn register_message(
         &mut self,
         namespace: &str,
@@ -190,8 +186,7 @@ impl DescriptorPool {
         for item in &message.enum_type {
             if !is_deprecated_enum(item) {
                 let name = full_name(&message_name, item.name());
-                self.enums.insert(name.clone());
-                self.enum_values.insert(name, collect_enum_values(item));
+                self.enums.insert(name);
             }
         }
 
@@ -212,9 +207,6 @@ impl DescriptorPool {
             .iter()
             .filter(|field| !is_deprecated_field(field))
             .collect::<Vec<_>>();
-        if message.field.is_empty() {
-            return Err(RegisterError::EmptyMessage { name: message_name });
-        }
         validate_field_shape(&message_name, &message.field)?;
 
         let mut descriptor = Descriptor {
@@ -228,31 +220,11 @@ impl DescriptorPool {
             ),
         };
 
-        if live_fields.len() == 1 && live_fields[0].name() == "_" {
-            let field = live_fields[0];
-            if field.label() != Label::Repeated {
-                return Err(RegisterError::InvalidAlias { name: message_name });
-            }
+        if let Some(field) = alias_field(&message_name, message)? {
             descriptor.alias = self.convert_field(&message_name, field, &map_entries)?;
         } else {
-            let mut used_ids = BTreeSet::new();
             for field in live_fields {
-                let number = field.number();
-                if number <= 0 {
-                    return Err(RegisterError::InvalidFieldNumber {
-                        message: message_name.clone(),
-                        field: field.name().to_owned(),
-                        number,
-                    });
-                }
-                let id = (number - 1) as usize;
-                if !used_ids.insert(id) {
-                    return Err(RegisterError::DuplicateFieldId {
-                        message: message_name.clone(),
-                        id,
-                    });
-                }
-
+                let id = (field.number() - 1) as usize;
                 let mut converted = self.convert_field(&message_name, field, &map_entries)?;
                 converted.id = id;
                 descriptor.fields.insert(field.name().to_owned(), converted);
@@ -273,7 +245,7 @@ impl DescriptorPool {
         &self,
         message_name: &str,
         source: &FieldDescriptorProto,
-        map_entries: &HashMap<String, DescriptorProto>,
+        map_entries: &HashMap<String, &DescriptorProto>,
     ) -> Result<Field, RegisterError> {
         let repeated = source.label() == Label::Repeated;
         let mut value =
@@ -405,10 +377,10 @@ impl DescriptorPool {
     }
 }
 
-fn register_map_entry_names(
-    map_entries: &mut HashMap<String, DescriptorProto>,
+fn register_map_entry_names<'a>(
+    map_entries: &mut HashMap<String, &'a DescriptorProto>,
     parent_name: &str,
-    nested: &DescriptorProto,
+    nested: &'a DescriptorProto,
 ) {
     let full = full_name(parent_name, nested.name());
     let mut names = vec![nested.name().to_owned(), full.clone(), format!(".{full}")];
@@ -416,7 +388,7 @@ fn register_map_entry_names(
         names.push(format!("{parent_short}.{}", nested.name()));
     }
     for name in names {
-        map_entries.insert(name, nested.clone());
+        map_entries.insert(name, nested);
     }
 }
 
@@ -514,7 +486,7 @@ fn is_deprecated_enum(item: &EnumDescriptorProto) -> bool {
         .unwrap_or(false)
 }
 
-fn is_deprecated_field(field: &FieldDescriptorProto) -> bool {
+pub(crate) fn is_deprecated_field(field: &FieldDescriptorProto) -> bool {
     field
         .options
         .as_ref()
@@ -522,11 +494,25 @@ fn is_deprecated_field(field: &FieldDescriptorProto) -> bool {
         .unwrap_or(false)
 }
 
-fn collect_enum_values(item: &EnumDescriptorProto) -> BTreeMap<String, i32> {
-    item.value
+// The alias convention is based on declared fields, including deprecated slots.
+// Keep this shared with dynamic encoding; the generator uses the validated pool.
+pub(crate) fn alias_field<'a>(
+    name: &str,
+    message: &'a DescriptorProto,
+) -> Result<Option<&'a FieldDescriptorProto>, RegisterError> {
+    let Some(field) = message
+        .field
         .iter()
-        .filter_map(|value| Some((value.name.clone()?, value.number?)))
-        .collect()
+        .find(|field| field.name() == "_" && !is_deprecated_field(field))
+    else {
+        return Ok(None);
+    };
+    if message.field.len() != 1 || field.number() != 1 || field.label() != Label::Repeated {
+        return Err(RegisterError::InvalidAlias {
+            name: name.to_owned(),
+        });
+    }
+    Ok(Some(field))
 }
 
 fn validate_field_shape(name: &str, fields: &[FieldDescriptorProto]) -> Result<(), RegisterError> {
@@ -538,6 +524,7 @@ fn validate_field_shape(name: &str, fields: &[FieldDescriptorProto]) -> Result<(
     }
 
     let mut max_field_number = 1;
+    let mut used_ids = BTreeSet::new();
     for field in fields {
         let number = field.number();
         if number <= 0 {
@@ -545,6 +532,12 @@ fn validate_field_shape(name: &str, fields: &[FieldDescriptorProto]) -> Result<(
                 message: name.to_owned(),
                 field: field.name().to_owned(),
                 number,
+            });
+        }
+        if !used_ids.insert(number) {
+            return Err(RegisterError::DuplicateFieldId {
+                message: name.to_owned(),
+                id: (number - 1) as usize,
             });
         }
         max_field_number = max_field_number.max(number);
@@ -637,7 +630,6 @@ mod tests {
         let mode = root.fields.get("mode").unwrap();
         assert_eq!(mode.value, FieldType::Enum);
         assert!(mode.value_type.is_empty());
-        assert_eq!(pool.find_enum_number("test.Mode", "MODE_C"), Some(2));
 
         let object = root.fields.get("object").unwrap();
         assert_eq!(object.value, FieldType::Message);

@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 #[cfg(protocache_test_has_flatbuffers_generated)]
 use std::borrow::Borrow;
+use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
@@ -66,8 +67,8 @@ mod fory_generated {
     warnings
 )]
 mod pcrs_generated {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test.pc.rs"));
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test.pc-ex.rs"));
+    include!(concat!(env!("OUT_DIR"), "/test.pc.rs"));
+    include!(concat!(env!("OUT_DIR"), "/test.pc-ex.rs"));
 }
 
 const DEFAULT_LOOPS: usize = 1_000_000;
@@ -332,7 +333,20 @@ fn main() -> BenchResult<()> {
         benchmark_protobuf_serialize(protobuf_raw, config.loops)?;
     }
     if config.should_run("protocache-serialize") {
-        benchmark_dynamic_to_protocache_serialize(&protocache_dynamic, config.loops)?;
+        benchmark_dynamic_to_protocache_serialize(
+            "protocache-serialize",
+            &protocache_dynamic,
+            config.loops,
+        )?;
+    }
+    for (name, maps) in [
+        ("protocache-serialize-arrays", false),
+        ("protocache-serialize-maps", true),
+    ] {
+        if config.should_run(name) {
+            let root = container_workload(&protocache_dynamic, maps);
+            benchmark_dynamic_to_protocache_serialize(name, &root, config.loops)?;
+        }
     }
     if config.should_run("protocache-fully") {
         benchmark_protocache_generated_serialize(&protocache_words, false, config.loops)?;
@@ -582,14 +596,64 @@ fn benchmark_protobuf_serialize(raw: &[u8], loops: usize) -> BenchResult<()> {
     let mut total_size = 0usize;
     let start = Instant::now();
     for _ in 0..loops {
-        let encoded = root.encode_to_vec();
-        total_size += encoded.len();
+        let encoded = black_box(&root).encode_to_vec();
+        total_size += black_box(encoded.as_slice()).len();
     }
     print_throughput_result("protobuf-serialize", start.elapsed(), loops, total_size);
     Ok(())
 }
 
+// Synthetic batch-shaped inputs reuse the fixture schema. Construction is outside timing.
+fn container_workload(root: &DynamicMessage, maps: bool) -> DynamicMessage {
+    let mut root = root.clone();
+    if maps {
+        for name in ["index", "objects"] {
+            let ReflectValue::Map(entries) = root.get_field_by_name(name).unwrap().into_owned()
+            else {
+                unreachable!("fixture field must be a map");
+            };
+            let mut samples = entries.into_iter().collect::<Vec<_>>();
+            samples.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let entries = (0..32)
+                .map(|i| {
+                    let key = if name == "index" {
+                        ReflectMapKey::String(format!(
+                            "config/service/{i:04}/{}",
+                            "x".repeat(i as usize % 32)
+                        ))
+                    } else {
+                        ReflectMapKey::I32(i)
+                    };
+                    (key, samples[i as usize % samples.len()].1.clone())
+                })
+                .collect();
+            root.set_field_by_name(name, ReflectValue::Map(entries));
+        }
+    } else {
+        for name in ["i32v", "u64v", "strv", "datav", "objectv"] {
+            let ReflectValue::List(items) = root.get_field_by_name(name).unwrap().into_owned()
+            else {
+                unreachable!("fixture field must be a list");
+            };
+            let items = (0..32)
+                .map(|i| {
+                    if name == "strv" {
+                        ReflectValue::String("x".repeat((i * 17) % 129))
+                    } else if name == "datav" {
+                        ReflectValue::Bytes(vec![i as u8; (i * 31) % 257].into())
+                    } else {
+                        items[i % items.len()].clone()
+                    }
+                })
+                .collect();
+            root.set_field_by_name(name, ReflectValue::List(items));
+        }
+    }
+    root
+}
+
 fn benchmark_dynamic_to_protocache_serialize(
+    name: &str,
     root: &DynamicMessage,
     loops: usize,
 ) -> BenchResult<()> {
@@ -597,15 +661,10 @@ fn benchmark_dynamic_to_protocache_serialize(
     let mut buffer = protocache_core::Buffer::new();
     let start = Instant::now();
     for _ in 0..loops {
-        let encoded = serialize_dynamic_into_buffer(root, &mut buffer)?;
-        total_size += encoded.len();
+        let encoded = serialize_dynamic_into_buffer(black_box(root), &mut buffer)?;
+        total_size += black_box(encoded).len();
     }
-    print_throughput_result(
-        "protocache-serialize",
-        start.elapsed(),
-        loops,
-        total_size,
-    );
+    print_throughput_result(name, start.elapsed(), loops, total_size);
     Ok(())
 }
 
@@ -637,8 +696,8 @@ fn benchmark_protocache_generated_serialize(
     let mut buffer = protocache_core::Buffer::new();
     let start = Instant::now();
     for _ in 0..loops {
-        let encoded = root.SerializeIntoBuffer(&mut buffer)?;
-        total_size += encoded.len();
+        let encoded = black_box(&root).SerializeIntoBuffer(&mut buffer)?;
+        total_size += black_box(encoded).len();
     }
     print_throughput_result(
         if partly {

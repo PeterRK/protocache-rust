@@ -8,7 +8,7 @@ use prost_types::{
     DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorProto,
     field_descriptor_proto::{Label, Type},
 };
-use protocache_extension::reflection::DescriptorPool;
+use protocache_extension::reflection::{DescriptorPool, FieldType};
 
 #[derive(Clone)]
 enum AliasTarget {
@@ -18,9 +18,9 @@ enum AliasTarget {
 }
 
 #[derive(Default)]
-struct Registry {
+struct Registry<'a> {
     rust_types: HashMap<String, String>,
-    map_entries: HashMap<String, DescriptorProto>,
+    map_entries: HashMap<String, &'a DescriptorProto>,
     aliases: HashMap<String, AliasTarget>,
 }
 
@@ -60,9 +60,9 @@ fn main() {
 }
 
 fn generate_response(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse, String> {
-    validate_request(request)?;
+    let schema = validate_request(request)?;
     let extra = request.parameter.as_deref() == Some("extra");
-    let registry = build_registry(&request.proto_file);
+    let registry = build_registry(&request.proto_file, &schema);
     let files: HashSet<_> = request.file_to_generate.iter().cloned().collect();
     let mut response = CodeGeneratorResponse::default();
 
@@ -93,13 +93,13 @@ fn generate_response(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResp
     Ok(response)
 }
 
-fn validate_request(request: &CodeGeneratorRequest) -> Result<(), String> {
+fn validate_request(request: &CodeGeneratorRequest) -> Result<DescriptorPool, String> {
     let mut pool = DescriptorPool::default();
     for file in &request.proto_file {
         pool.register(file)
             .map_err(|err| format!("schema validation failed: {err:?}"))?;
     }
-    Ok(())
+    Ok(pool)
 }
 
 fn emit_error(message: &str) {
@@ -127,7 +127,7 @@ fn convert_ex_filename(name: &str) -> String {
     }
 }
 
-fn build_registry(files: &[FileDescriptorProto]) -> Registry {
+fn build_registry<'a>(files: &'a [FileDescriptorProto], schema: &DescriptorPool) -> Registry<'a> {
     let mut registry = Registry::default();
     for file in files {
         let package = file.package();
@@ -138,26 +138,30 @@ fn build_registry(files: &[FileDescriptorProto]) -> Registry {
             );
         }
         for message in &file.message_type {
-            collect_message_types(&mut registry, package, None, message);
+            collect_message_types(&mut registry, schema, package, None, message);
         }
     }
     registry
 }
 
-fn collect_message_types(
-    registry: &mut Registry,
+fn collect_message_types<'a>(
+    registry: &mut Registry<'a>,
+    schema: &DescriptorPool,
     package: &str,
     parent: Option<&str>,
-    message: &DescriptorProto,
+    message: &'a DescriptorProto,
 ) {
     let full = if let Some(parent) = parent {
         format!("{parent}.{}", message.name())
     } else {
         format!("{}.{}", package_prefix(package), message.name())
     };
+    let Some(descriptor) = schema.find(full.trim_start_matches('.')) else {
+        return; // Deprecated messages are absent from the validated schema.
+    };
     registry.rust_types.insert(
         full.clone(),
-        flatten_name(&full, package, is_alias_message(message), parent.is_some()),
+        flatten_name(&full, package, descriptor.is_alias(), parent.is_some()),
     );
 
     for nested in &message.nested_type {
@@ -168,10 +172,10 @@ fn collect_message_types(
             .and_then(|o| o.map_entry)
             .unwrap_or(false)
         {
-            registry.map_entries.insert(nested_full, nested.clone());
+            registry.map_entries.insert(nested_full, nested);
             continue;
         }
-        collect_message_types(registry, package, Some(&full), nested);
+        collect_message_types(registry, schema, package, Some(&full), nested);
     }
 
     for item in &message.enum_type {
@@ -181,14 +185,11 @@ fn collect_message_types(
         );
     }
 
-    if is_alias_message(message) {
-        let field = &message.field[0];
-        let target = if field.label() == Label::Repeated && field.r#type() == Type::Bool {
-            AliasTarget::BoolArray
-        } else if field.r#type() == Type::Message
-            && registry.map_entries.contains_key(field.type_name())
-        {
+    if descriptor.is_alias() {
+        let target = if descriptor.alias.is_map() {
             AliasTarget::Map
+        } else if descriptor.alias.value == FieldType::Bool {
+            AliasTarget::BoolArray
         } else {
             AliasTarget::Array
         };
@@ -301,6 +302,9 @@ fn generate_message(
         format!("{}.{}", package_prefix(package), message.name())
     };
 
+    if !registry.rust_types.contains_key(&full) {
+        return Ok(());
+    }
     if kind == OutputKind::Readonly {
         for item in &message.enum_type {
             generate_enum(out, item, indent);
@@ -320,14 +324,14 @@ fn generate_message(
 
     match kind {
         OutputKind::Readonly => {
-            if is_alias_message(message) {
+            if registry.aliases.contains_key(&full) {
                 generate_alias_readonly(out, registry, message, &full, indent)?;
             } else {
                 generate_regular_message(out, registry, message, &full, indent)?;
             }
         }
         OutputKind::Extra => {
-            if is_alias_message(message) {
+            if registry.aliases.contains_key(&full) {
                 generate_alias_extra(out, registry, message, &full, indent)?;
             } else {
                 generate_mutable_message(out, registry, message, &full, indent)?;
@@ -354,14 +358,15 @@ fn generate_alias_readonly(
         .get(full)
         .ok_or_else(|| format!("missing alias target for {full}"))?;
 
-    let view_ty = match target {
-        AliasTarget::BoolArray | AliasTarget::Array => "ArrayView<'a>",
-        AliasTarget::Map => "MapView<'a>",
+    let view_type = match target {
+        AliasTarget::BoolArray => "StringView",
+        AliasTarget::Array => "ArrayView",
+        AliasTarget::Map => "MapView",
     };
 
     writeln!(out, "{pad}#[derive(Clone, Copy, Debug)]").unwrap();
     writeln!(out, "{pad}pub struct {rust_name}<'a> {{").unwrap();
-    writeln!(out, "{pad}    view: {view_ty},").unwrap();
+    writeln!(out, "{pad}    view: {view_type}<'a>,").unwrap();
     writeln!(out, "{pad}}}\n").unwrap();
 
     writeln!(out, "{pad}impl<'a> {rust_name}<'a> {{").unwrap();
@@ -370,29 +375,11 @@ fn generate_alias_readonly(
         "{pad}    pub fn FromWords(words: &'a [u32]) -> Option<Self> {{"
     )
     .unwrap();
-    match target {
-        AliasTarget::BoolArray => {
-            writeln!(
-                out,
-                "{pad}        Some(Self {{ view: ArrayView::new(words)? }})"
-            )
-            .unwrap();
-        }
-        AliasTarget::Array => {
-            writeln!(
-                out,
-                "{pad}        Some(Self {{ view: ArrayView::new(words)? }})"
-            )
-            .unwrap();
-        }
-        AliasTarget::Map => {
-            writeln!(
-                out,
-                "{pad}        Some(Self {{ view: MapView::new(words)? }})"
-            )
-            .unwrap();
-        }
-    }
+    writeln!(
+        out,
+        "{pad}        Some(Self {{ view: {view_type}::new(words)? }})"
+    )
+    .unwrap();
     writeln!(out, "{pad}    }}").unwrap();
     match target {
         AliasTarget::BoolArray => {
@@ -401,60 +388,24 @@ fn generate_alias_readonly(
                 "{pad}    fn DetectLen(words: &'a [u32]) -> Option<usize> {{"
             )
             .unwrap();
-            writeln!(out, "{pad}        ArrayView::detect_len(words)").unwrap();
-            writeln!(out, "{pad}    }}").unwrap();
-            writeln!(
-                out,
-                "{pad}    pub fn Detect(words: &'a [u32]) -> Option<&'a [u32]> {{"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "{pad}        Some(words.get(..Self::DetectLen(words)?)?)"
-            )
-            .unwrap();
+            writeln!(out, "{pad}        StringView::detect_len(words)").unwrap();
             writeln!(out, "{pad}    }}").unwrap();
         }
-        AliasTarget::Array => {
-            write_alias_array_detect_len(out, registry, message, indent)?;
-            writeln!(
-                out,
-                "{pad}    pub fn Detect(words: &'a [u32]) -> Option<&'a [u32]> {{"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "{pad}        Some(words.get(..Self::DetectLen(words)?)?)"
-            )
-            .unwrap();
-            writeln!(out, "{pad}    }}").unwrap();
-        }
-        AliasTarget::Map => {
-            write_alias_map_detect_len(out, registry, message, indent)?;
-            writeln!(
-                out,
-                "{pad}    pub fn Detect(words: &'a [u32]) -> Option<&'a [u32]> {{"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "{pad}        Some(words.get(..Self::DetectLen(words)?)?)"
-            )
-            .unwrap();
-            writeln!(out, "{pad}    }}").unwrap();
-        }
+        AliasTarget::Array => write_alias_array_detect_len(out, registry, message, indent)?,
+        AliasTarget::Map => write_alias_map_detect_len(out, registry, message, indent)?,
     }
+    writeln!(
+        out,
+        "{pad}    pub fn Detect(words: &'a [u32]) -> Option<&'a [u32]> {{"
+    )
+    .unwrap();
+    writeln!(out, "{pad}        words.get(..Self::DetectLen(words)?)").unwrap();
+    writeln!(out, "{pad}    }}").unwrap();
     let field = &message.field[0];
     match target {
         AliasTarget::Array => {
-            if let Some(return_ty) = repeated_scalar_return(field) {
-                let direct_return_ty = return_ty
-                    .strip_prefix("Option<")
-                    .and_then(|value| value.strip_suffix('>'))
-                    .ok_or_else(|| {
-                        format!("alias scalar return should be Option<T>: {return_ty}")
-                    })?;
-                writeln!(out, "{pad}    pub fn values(self) -> {direct_return_ty} {{").unwrap();
+            if let Some(return_ty) = repeated_scalar_type(field) {
+                writeln!(out, "{pad}    pub fn values(self) -> {return_ty} {{").unwrap();
                 writeln!(
                     out,
                     "{pad}        {}.expect(\"generated alias invariant violated: {rust_name}\")",
@@ -469,12 +420,16 @@ fn generate_alias_readonly(
             }
         }
         AliasTarget::Map => {
-            let return_ty = alias_map_view_return(field, registry)?;
+            let return_ty = map_view_return(field, registry)?;
             writeln!(out, "{pad}    pub fn entries(self) -> {return_ty} {{").unwrap();
             writeln!(out, "{pad}        ViewMap::new(self.view)").unwrap();
             writeln!(out, "{pad}    }}").unwrap();
         }
-        AliasTarget::BoolArray => {}
+        AliasTarget::BoolArray => {
+            writeln!(out, "{pad}    pub fn values(self) -> BoolArray<'a> {{").unwrap();
+            writeln!(out, "{pad}        self.view.as_bool_array()").unwrap();
+            writeln!(out, "{pad}    }}").unwrap();
+        }
     }
     writeln!(out, "{pad}}}\n").unwrap();
     writeln!(out, "{pad}impl<'a> FieldDecode<'a> for {rust_name}<'a> {{").unwrap();
@@ -503,9 +458,24 @@ fn generate_alias_extra(
         .ok_or_else(|| format!("missing alias rust name for {full}"))?;
     let field = &message.field[0];
     let mutable_name = format!("{rust_name}Mutable");
-    let mutable_ty = alias_mutable_type(field, registry)?;
+    let mutable_ty = mutable_field_type(field, registry)?;
     writeln!(out, "{pad}pub type {mutable_name}<'a> = {mutable_ty};\n").unwrap();
     Ok(())
+}
+
+fn live_fields(message: &DescriptorProto) -> BTreeMap<i32, &FieldDescriptorProto> {
+    message
+        .field
+        .iter()
+        .filter(|field| {
+            !field
+                .options
+                .as_ref()
+                .and_then(|o| o.deprecated)
+                .unwrap_or(false)
+        })
+        .map(|field| (field.number(), field))
+        .collect()
 }
 
 fn generate_regular_message(
@@ -557,18 +527,7 @@ fn generate_regular_message(
     .unwrap();
     out.push('\n');
 
-    let mut fields = BTreeMap::new();
-    for field in &message.field {
-        if field
-            .options
-            .as_ref()
-            .and_then(|o| o.deprecated)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        fields.insert(field.number(), field);
-    }
+    let fields = live_fields(message);
     for field in fields.values() {
         writeln!(
             out,
@@ -610,18 +569,7 @@ fn generate_mutable_message(
     let mutable_name = format!("{rust_name}Mutable");
     let readonly_name = rust_name.as_str();
 
-    let mut fields = BTreeMap::new();
-    for field in &message.field {
-        if field
-            .options
-            .as_ref()
-            .and_then(|o| o.deprecated)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        fields.insert(field.number(), field);
-    }
+    let fields = live_fields(message);
     let max_id = fields.keys().last().copied().unwrap_or(0);
     let accessed_words = (max_id + 63) / 64;
 
@@ -760,46 +708,9 @@ fn generate_mutable_message(
 
     writeln!(
         out,
-        "{pad}impl<'a> MutableArrayElement<'a> for {mutable_name}<'a> {{"
+        "{pad}impl<'a> MutableArrayElement<'a> for {mutable_name}<'a> {{}}\n"
     )
     .unwrap();
-    writeln!(
-        out,
-        "{pad}    fn decode_array(words: &'a [u32]) -> Option<Vec<Self>> {{"
-    )
-    .unwrap();
-    writeln!(out, "{pad}        let array = ArrayView::new(words)?;").unwrap();
-    writeln!(
-        out,
-        "{pad}        let mut values = Vec::with_capacity(array.len());"
-    )
-    .unwrap();
-    writeln!(out, "{pad}        for item in array.iter() {{ values.push(Self::FromWords(item.object_words()?)?); }}").unwrap();
-    writeln!(out, "{pad}        Some(values)").unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
-    writeln!(out, "{pad}    fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError> {{").unwrap();
-    writeln!(
-        out,
-        "{pad}        if values.is_empty() {{ return Ok(Unit::inline(&[1])); }}"
-    )
-    .unwrap();
-    writeln!(out, "{pad}        let last = buffer.len();").unwrap();
-    writeln!(
-        out,
-        "{pad}        let mut units = vec![Unit::empty(); values.len()];"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "{pad}        for i in (0..values.len()).rev() {{ units[i] = values[i].encode(buffer)?; }}"
-    )
-    .unwrap();
-    writeln!(out, "{pad}        protocache_core::serialize_array_at_mut(&mut units, buffer, last).ok_or_else(|| MutableError::SerializeFailed {{").unwrap();
-    writeln!(out, "{pad}            descriptor: \"{full}\".to_owned(),").unwrap();
-    writeln!(out, "{pad}            field: \"<array>\".to_owned(),").unwrap();
-    writeln!(out, "{pad}        }})").unwrap();
-    writeln!(out, "{pad}    }}").unwrap();
-    writeln!(out, "{pad}}}\n").unwrap();
     Ok(())
 }
 
@@ -890,25 +801,7 @@ fn write_alias_map_detect_len(
     indent: usize,
 ) -> Result<(), String> {
     let pad = "    ".repeat(indent);
-    let entry = registry
-        .map_entries
-        .get(message.field[0].type_name())
-        .ok_or_else(|| {
-            format!(
-                "missing alias map entry for {}",
-                message.field[0].type_name()
-            )
-        })?;
-    let key = entry
-        .field
-        .first()
-        .ok_or_else(|| format!("missing map key field for {}", message.field[0].type_name()))?;
-    let value = entry.field.get(1).ok_or_else(|| {
-        format!(
-            "missing map value field for {}",
-            message.field[0].type_name()
-        )
-    })?;
+    let (key, value) = map_entry_fields(&message.field[0], registry)?;
     let key_expr = singular_detect_expr(key, registry, "key")?;
     let value_expr = singular_detect_expr(value, registry, "value")?;
     writeln!(
@@ -939,18 +832,7 @@ fn write_message_detect_len(
     .unwrap();
     writeln!(out, "{pad}        let view = MessageView::detect(words)?;").unwrap();
 
-    let mut fields = BTreeMap::new();
-    for field in &message.field {
-        if field
-            .options
-            .as_ref()
-            .and_then(|o| o.deprecated)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        fields.insert(field.number(), field);
-    }
+    let fields = live_fields(message);
 
     if fields.is_empty() {
         writeln!(out, "{pad}        Some(view.len())").unwrap();
@@ -988,18 +870,7 @@ fn field_detect_expr(
     var: &str,
 ) -> Result<String, String> {
     if is_map_field(field, registry) {
-        let entry = registry
-            .map_entries
-            .get(field.type_name())
-            .ok_or_else(|| format!("missing map entry for {}", field.type_name()))?;
-        let key = entry
-            .field
-            .first()
-            .ok_or_else(|| format!("missing map key field for {}", field.type_name()))?;
-        let value = entry
-            .field
-            .get(1)
-            .ok_or_else(|| format!("missing map value field for {}", field.type_name()))?;
+        let (key, value) = map_entry_fields(field, registry)?;
         let key_expr = singular_detect_expr(key, registry, "key")?;
         let value_expr = singular_detect_expr(value, registry, "value")?;
         return Ok(format!(
@@ -1074,18 +945,7 @@ fn singular_detect_expr(
 
 fn mutable_field_type(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
     if is_map_field(field, registry) {
-        let entry = registry
-            .map_entries
-            .get(field.type_name())
-            .ok_or_else(|| format!("missing map entry for {}", field.type_name()))?;
-        let key = entry
-            .field
-            .first()
-            .ok_or_else(|| format!("missing map key field for {}", field.type_name()))?;
-        let value = entry
-            .field
-            .get(1)
-            .ok_or_else(|| format!("missing map value field for {}", field.type_name()))?;
+        let (key, value) = map_entry_fields(field, registry)?;
         return Ok(format!(
             "MutableMap<'a, {}, {}>",
             mutable_key_type(key)?,
@@ -1132,50 +992,18 @@ fn mutable_key_type(field: &FieldDescriptorProto) -> Result<String, String> {
 }
 
 fn mutable_value_type(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
+    if let Some(ty) = scalar_type(field.r#type()) {
+        return Ok(ty.to_owned());
+    }
     Ok(match field.r#type() {
-        Type::Bool => "bool".to_owned(),
-        Type::Int32 | Type::Sint32 | Type::Sfixed32 => "i32".to_owned(),
-        Type::Uint32 | Type::Fixed32 => "u32".to_owned(),
-        Type::Int64 | Type::Sint64 | Type::Sfixed64 => "i64".to_owned(),
-        Type::Uint64 | Type::Fixed64 => "u64".to_owned(),
-        Type::Float => "f32".to_owned(),
-        Type::Double => "f64".to_owned(),
         Type::String => "String".to_owned(),
         Type::Bytes => "Vec<u8>".to_owned(),
-        Type::Enum => "EnumValue".to_owned(),
         Type::Message => format!(
             "{}<'a>",
             rust_mutable_base_name(registry, field.type_name())?
         ),
         other => return Err(format!("unsupported mutable value type: {other:?}")),
     })
-}
-
-fn alias_mutable_type(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
-    if is_map_field(field, registry) {
-        let entry = registry
-            .map_entries
-            .get(field.type_name())
-            .ok_or_else(|| format!("missing alias map entry for {}", field.type_name()))?;
-        let key = entry
-            .field
-            .first()
-            .ok_or_else(|| format!("missing map key field for {}", field.type_name()))?;
-        let value = entry
-            .field
-            .get(1)
-            .ok_or_else(|| format!("missing map value field for {}", field.type_name()))?;
-        Ok(format!(
-            "MutableMap<'a, {}, {}>",
-            mutable_key_type(key)?,
-            mutable_value_type(value, registry)?
-        ))
-    } else {
-        Ok(format!(
-            "MutableArray<'a, {}>",
-            mutable_value_type(field, registry)?
-        ))
-    }
 }
 
 fn generate_getter(
@@ -1205,8 +1033,12 @@ fn generate_getter(
     }
 
     if field.label() == Label::Repeated {
-        if let Some(return_ty) = repeated_scalar_return(field) {
-            writeln!(out, "{pad}    pub fn {name}(self) -> {return_ty} {{").unwrap();
+        if let Some(return_ty) = repeated_scalar_type(field) {
+            writeln!(
+                out,
+                "{pad}    pub fn {name}(self) -> Option<{return_ty}> {{"
+            )
+            .unwrap();
             writeln!(
                 out,
                 "{pad}        {}",
@@ -1255,67 +1087,12 @@ fn generate_getter(
             writeln!(out, "{pad}    pub fn {name}(self) -> Option<&'a [u8]> {{").unwrap();
             writeln!(out, "{pad}        self.view.bytes(Self::{field_id})").unwrap();
         }
-        Type::Bool => {
-            writeln!(out, "{pad}    pub fn {name}(self) -> bool {{").unwrap();
+        ty if scalar_type(ty).is_some() => {
+            let ty = scalar_type(ty).unwrap();
+            writeln!(out, "{pad}    pub fn {name}(self) -> {ty} {{").unwrap();
             writeln!(
                 out,
-                "{pad}        self.view.scalar::<bool>(Self::{field_id}).unwrap_or(false)"
-            )
-            .unwrap();
-        }
-        Type::Int32 | Type::Sint32 | Type::Sfixed32 => {
-            writeln!(out, "{pad}    pub fn {name}(self) -> i32 {{").unwrap();
-            writeln!(
-                out,
-                "{pad}        self.view.scalar::<i32>(Self::{field_id}).unwrap_or_default()"
-            )
-            .unwrap();
-        }
-        Type::Uint32 | Type::Fixed32 => {
-            writeln!(out, "{pad}    pub fn {name}(self) -> u32 {{").unwrap();
-            writeln!(
-                out,
-                "{pad}        self.view.scalar::<u32>(Self::{field_id}).unwrap_or_default()"
-            )
-            .unwrap();
-        }
-        Type::Int64 | Type::Sint64 | Type::Sfixed64 => {
-            writeln!(out, "{pad}    pub fn {name}(self) -> i64 {{").unwrap();
-            writeln!(
-                out,
-                "{pad}        self.view.scalar::<i64>(Self::{field_id}).unwrap_or_default()"
-            )
-            .unwrap();
-        }
-        Type::Uint64 | Type::Fixed64 => {
-            writeln!(out, "{pad}    pub fn {name}(self) -> u64 {{").unwrap();
-            writeln!(
-                out,
-                "{pad}        self.view.scalar::<u64>(Self::{field_id}).unwrap_or_default()"
-            )
-            .unwrap();
-        }
-        Type::Float => {
-            writeln!(out, "{pad}    pub fn {name}(self) -> f32 {{").unwrap();
-            writeln!(
-                out,
-                "{pad}        self.view.scalar::<f32>(Self::{field_id}).unwrap_or_default()"
-            )
-            .unwrap();
-        }
-        Type::Double => {
-            writeln!(out, "{pad}    pub fn {name}(self) -> f64 {{").unwrap();
-            writeln!(
-                out,
-                "{pad}        self.view.scalar::<f64>(Self::{field_id}).unwrap_or_default()"
-            )
-            .unwrap();
-        }
-        Type::Enum => {
-            writeln!(out, "{pad}    pub fn {name}(self) -> EnumValue {{").unwrap();
-            writeln!(
-                out,
-                "{pad}        self.view.scalar::<EnumValue>(Self::{field_id}).unwrap_or_default()"
+                "{pad}        self.view.scalar::<{ty}>(Self::{field_id}).unwrap_or_default()"
             )
             .unwrap();
         }
@@ -1352,39 +1129,41 @@ fn generate_getter(
     Ok(())
 }
 
-fn repeated_scalar_return(field: &FieldDescriptorProto) -> Option<String> {
+fn scalar_type(ty: Type) -> Option<&'static str> {
+    Some(match ty {
+        Type::Bool => "bool",
+        Type::Int32 | Type::Sint32 | Type::Sfixed32 => "i32",
+        Type::Uint32 | Type::Fixed32 => "u32",
+        Type::Int64 | Type::Sint64 | Type::Sfixed64 => "i64",
+        Type::Uint64 | Type::Fixed64 => "u64",
+        Type::Float => "f32",
+        Type::Double => "f64",
+        Type::Enum => "EnumValue",
+        _ => return None,
+    })
+}
+
+fn repeated_scalar_type(field: &FieldDescriptorProto) -> Option<String> {
     if field.label() != Label::Repeated {
         return None;
     }
-    match field.r#type() {
-        Type::Bool => Some("Option<BoolArray<'a>>".to_owned()),
-        Type::Int32 | Type::Sint32 | Type::Sfixed32 => {
-            Some("Option<ScalarArray<'a, i32>>".to_owned())
-        }
-        Type::Uint32 | Type::Fixed32 => Some("Option<ScalarArray<'a, u32>>".to_owned()),
-        Type::Int64 | Type::Sint64 | Type::Sfixed64 => {
-            Some("Option<ScalarArray<'a, i64>>".to_owned())
-        }
-        Type::Uint64 | Type::Fixed64 => Some("Option<ScalarArray<'a, u64>>".to_owned()),
-        Type::Float => Some("Option<ScalarArray<'a, f32>>".to_owned()),
-        Type::Double => Some("Option<ScalarArray<'a, f64>>".to_owned()),
-        Type::Enum => Some("Option<ScalarArray<'a, EnumValue>>".to_owned()),
-        _ => None,
+    if field.r#type() == Type::Bool {
+        Some("BoolArray<'a>".to_owned())
+    } else {
+        Some(format!("ScalarArray<'a, {}>", scalar_type(field.r#type())?))
     }
 }
 
 fn repeated_scalar_expr(field: &FieldDescriptorProto, array_expr: &str) -> Result<String, String> {
-    Ok(match field.r#type() {
-        Type::Bool => format!("self.view.bools(Self::{})", field_const_name(field)),
-        Type::Int32 | Type::Sint32 | Type::Sfixed32 => format!("{array_expr}.scalars::<i32>()"),
-        Type::Uint32 | Type::Fixed32 => format!("{array_expr}.scalars::<u32>()"),
-        Type::Int64 | Type::Sint64 | Type::Sfixed64 => format!("{array_expr}.scalars::<i64>()"),
-        Type::Uint64 | Type::Fixed64 => format!("{array_expr}.scalars::<u64>()"),
-        Type::Float => format!("{array_expr}.scalars::<f32>()"),
-        Type::Double => format!("{array_expr}.scalars::<f64>()"),
-        Type::Enum => format!("{array_expr}.scalars::<EnumValue>()"),
-        other => return Err(format!("unsupported repeated scalar type: {other:?}")),
-    })
+    if field.r#type() == Type::Bool {
+        return Ok(format!(
+            "self.view.bools(Self::{})",
+            field_const_name(field)
+        ));
+    }
+    let ty = scalar_type(field.r#type())
+        .ok_or_else(|| format!("unsupported repeated scalar type: {:?}", field.r#type()))?;
+    Ok(format!("{array_expr}.scalars::<{ty}>()"))
 }
 
 fn repeated_view_return(
@@ -1405,19 +1184,22 @@ fn repeated_view_return(
     })
 }
 
-fn map_view_return(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
+fn map_entry_fields<'a>(
+    field: &FieldDescriptorProto,
+    registry: &'a Registry<'_>,
+) -> Result<(&'a FieldDescriptorProto, &'a FieldDescriptorProto), String> {
     let entry = registry
         .map_entries
         .get(field.type_name())
         .ok_or_else(|| format!("missing map entry for {}", field.type_name()))?;
-    let key = entry
-        .field
-        .first()
-        .ok_or_else(|| format!("missing map key field for {}", field.type_name()))?;
-    let value = entry
-        .field
-        .get(1)
-        .ok_or_else(|| format!("missing map value field for {}", field.type_name()))?;
+    match entry.field.as_slice() {
+        [key, value] => Ok((key, value)),
+        _ => Err(format!("invalid map entry for {}", field.type_name())),
+    }
+}
+
+fn map_view_return(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
+    let (key, value) = map_entry_fields(field, registry)?;
     Ok(format!(
         "ViewMap<'a, {}, {}>",
         decode_type_name(key, registry)?,
@@ -1425,23 +1207,11 @@ fn map_view_return(field: &FieldDescriptorProto, registry: &Registry) -> Result<
     ))
 }
 
-fn alias_map_view_return(
-    field: &FieldDescriptorProto,
-    registry: &Registry,
-) -> Result<String, String> {
-    map_view_return(field, registry)
-}
-
 fn decode_type_name(field: &FieldDescriptorProto, registry: &Registry) -> Result<String, String> {
+    if let Some(ty) = scalar_type(field.r#type()) {
+        return Ok(ty.to_owned());
+    }
     Ok(match field.r#type() {
-        Type::Bool => "bool".to_owned(),
-        Type::Int32 | Type::Sint32 | Type::Sfixed32 => "i32".to_owned(),
-        Type::Uint32 | Type::Fixed32 => "u32".to_owned(),
-        Type::Int64 | Type::Sint64 | Type::Sfixed64 => "i64".to_owned(),
-        Type::Uint64 | Type::Fixed64 => "u64".to_owned(),
-        Type::Float => "f32".to_owned(),
-        Type::Double => "f64".to_owned(),
-        Type::Enum => "EnumValue".to_owned(),
         Type::String | Type::Bytes => "StringView<'a>".to_owned(),
         Type::Message => {
             let rust_type = rust_type_name(registry, field.type_name())?;
@@ -1497,10 +1267,6 @@ fn package_depth(package: &str) -> usize {
     }
 }
 
-fn is_alias_message(message: &DescriptorProto) -> bool {
-    message.field.len() == 1 && message.field[0].name() == "_"
-}
-
 fn is_map_field(field: &FieldDescriptorProto, registry: &Registry) -> bool {
     field.label() == Label::Repeated
         && field.r#type() == Type::Message
@@ -1540,6 +1306,10 @@ mod tests {
             "pub struct Root<'a>",
             "pub struct RootInner<'a>",
             "pub struct Floats<'a>",
+            "pub struct Bools<'a>",
+            "view: StringView<'a>",
+            "StringView::detect_len(words)",
+            "pub fn values(self) -> BoolArray<'a>",
             "pub struct AliasMap<'a>",
             "pub fn parent(self) -> Option<Root<'a>>",
             "pub fn labels(self) -> Option<ViewMap<'a, StringView<'a>, Child<'a>>>",
@@ -1558,6 +1328,7 @@ mod tests {
             "pub struct RootMutable<'a>",
             "pub struct RootInnerMutable<'a>",
             "pub type FloatsMutable<'a> = MutableArray<'a, f32>;",
+            "pub type BoolsMutable<'a> = MutableArray<'a, bool>;",
             "pub type AliasMapMutable<'a> = MutableMap<'a, String, ChildMutable<'a>>;",
             "_labels: MutableMap<'a, String, ChildMutable<'a>>",
         ] {
@@ -1595,6 +1366,33 @@ mod tests {
             response.file[0]
                 .content()
                 .contains("pub struct Dependency<'a>")
+        );
+    }
+
+    #[test]
+    fn rejects_alias_with_deprecated_sibling_before_generation() {
+        let mut old = field("old", 2, Label::Optional, Type::Int32, None);
+        old.options = Some(FieldOptions {
+            deprecated: Some(true),
+            ..Default::default()
+        });
+        let request = CodeGeneratorRequest {
+            file_to_generate: vec!["invalid.proto".to_owned()],
+            proto_file: vec![FileDescriptorProto {
+                name: Some("invalid.proto".to_owned()),
+                message_type: vec![DescriptorProto {
+                    name: Some("Alias".to_owned()),
+                    field: vec![field("_", 1, Label::Repeated, Type::Int32, None), old],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            generate_response(&request)
+                .unwrap_err()
+                .contains("InvalidAlias")
         );
     }
 
@@ -1644,6 +1442,11 @@ mod tests {
         let floats = DescriptorProto {
             name: Some("Floats".to_owned()),
             field: vec![field("_", 1, Label::Repeated, Type::Float, None)],
+            ..DescriptorProto::default()
+        };
+        let bools = DescriptorProto {
+            name: Some("Bools".to_owned()),
+            field: vec![field("_", 1, Label::Repeated, Type::Bool, None)],
             ..DescriptorProto::default()
         };
         let alias_map = DescriptorProto {
@@ -1748,7 +1551,7 @@ mod tests {
                 ],
                 ..EnumDescriptorProto::default()
             }],
-            message_type: vec![child, floats, alias_map, root],
+            message_type: vec![child, floats, bools, alias_map, root],
             ..FileDescriptorProto::default()
         }
     }

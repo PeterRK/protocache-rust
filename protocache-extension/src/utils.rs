@@ -55,7 +55,9 @@ impl std::error::Error for JsonError {
 
 /// Transcodes a concrete prost message into owned ProtoCache words.
 ///
-/// `descriptor` must describe `M`; a mismatch is reported as [`MutableError`].
+/// `descriptor` must describe `M`. This pairing is the caller's responsibility:
+/// protobuf wire-compatible mismatches cannot reliably be detected. Decode or
+/// encoding failures are reported as [`MutableError`].
 pub fn serialize_prost<M: Message>(
     message: &M,
     descriptor: MessageDescriptor,
@@ -65,7 +67,9 @@ pub fn serialize_prost<M: Message>(
 
 /// Transcodes a prost message into a reusable ProtoCache [`Buffer`].
 ///
-/// The returned words borrow `buffer` until it is mutated again.
+/// The returned words borrow `buffer` until it is mutated again. The descriptor
+/// pairing requirement is the same as for [`serialize_prost`]. On error, buffer
+/// contents are unspecified; clear or reuse it before reading an output.
 pub fn serialize_prost_into_buffer<'b, M: Message>(
     message: &M,
     descriptor: MessageDescriptor,
@@ -97,6 +101,9 @@ pub fn serialize_dynamic(message: &DynamicMessage) -> Result<Vec<u32>, MutableEr
 }
 
 /// Serializes a reflected protobuf message into a reusable buffer.
+///
+/// The returned slice borrows `buffer`. On error, its contents are unspecified;
+/// clear or reuse the buffer before reading an output.
 pub fn serialize_dynamic_into_buffer<'b>(
     message: &DynamicMessage,
     buffer: &'b mut Buffer,

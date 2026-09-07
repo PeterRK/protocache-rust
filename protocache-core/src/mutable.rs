@@ -1,4 +1,10 @@
 //! Mutable surface matching `access-ex.h`.
+//!
+//! Mutable access marks a container dirty even if the caller does not change its
+//! value. Dirty tracking is conservative, includes nested changes, and is not
+//! reset by serialization. Dirty queries report observable container state; generated
+//! messages decide whether to reuse source words from their field-access bitset.
+//! Borrows of encoded input must remain valid for the lifetime of the wrapper.
 
 use std::array;
 use std::borrow::Borrow;
@@ -6,7 +12,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
 
-use crate::access::checked_slice_end;
+use crate::access::{detect_array_with, detect_map_with};
 use crate::serialize::serialize_map_pairs_at_mut;
 use crate::{
     ArrayView, Buffer, FieldView, MapKey, MapView, MessageView, Scalar, StringView, Unit,
@@ -101,9 +107,11 @@ pub trait MutableField<'a>: Clone + Default {
     {
         true
     }
+    /// Reports modifications conservatively; generated serialization uses field access state.
     fn is_dirty(&self) -> bool {
         false
     }
+    /// Reports changes in this value, including its children where applicable.
     fn has_nested_dirty(&self) -> bool {
         self.is_dirty()
     }
@@ -112,14 +120,23 @@ pub trait MutableField<'a>: Clone + Default {
 
 /// Array-specific extension of [`MutableField`] used by generated bindings.
 pub trait MutableArrayElement<'a>: MutableField<'a> {
-    fn decode_array(words: &'a [u32]) -> Option<Vec<Self>>;
+    fn decode_array(words: &'a [u32]) -> Option<Vec<Self>> {
+        let array = ArrayView::new(words)?;
+        let mut values = Vec::with_capacity(array.len());
+        for item in array.iter() {
+            values.push(Self::decode(item)?);
+        }
+        Some(values)
+    }
     fn detect_array_words(words: &'a [u32]) -> Option<&'a [u32]> {
         detect_array_words::<Self>(words)
     }
     fn detect_array_field(field: FieldView<'a>) -> Option<&'a [u32]> {
         Self::detect_array_words(field.object_words()?)
     }
-    fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError>;
+    fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError> {
+        encode_object_array(values, buffer)
+    }
 }
 
 /// Map-key encoding contract used by [`MutableMap`].
@@ -504,39 +521,14 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableMap<'a, K, V> {
 
 #[inline(always)]
 fn detect_array_words<'a, T: MutableField<'a>>(words: &'a [u32]) -> Option<&'a [u32]> {
-    let array = ArrayView::new(words)?;
-    let end = array.total_words();
-    for index in (0..array.len()).rev() {
-        let detected = T::detect(array.expect_field(index))?;
-        let detected_end = checked_slice_end(words, detected)?;
-        if detected_end > end {
-            return words.get(..detected_end);
-        }
-    }
-    words.get(..end)
+    detect_array_with(words, T::detect)
 }
 
 #[inline(always)]
 fn detect_map_words<'a, K: MutableMapKey<'a>, V: MutableField<'a>>(
     words: &'a [u32],
 ) -> Option<&'a [u32]> {
-    let map = MapView::new(words)?;
-    let end = map.total_words();
-    for index in (0..map.len()).rev() {
-        let pair = map.expect_pair(index);
-        let detected = V::detect(pair.value())?;
-        let detected_end = checked_slice_end(words, detected)?;
-        if detected_end > end {
-            return words.get(..detected_end);
-        }
-
-        let detected = K::detect_key(pair.key())?;
-        let detected_end = checked_slice_end(words, detected)?;
-        if detected_end > end {
-            return words.get(..detected_end);
-        }
-    }
-    words.get(..end)
+    detect_map_with(words, K::detect_key, V::detect)
 }
 
 #[derive(Clone, Debug)]
@@ -868,20 +860,7 @@ impl<'a> MutableField<'a> for String {
     }
 }
 
-impl<'a> MutableArrayElement<'a> for String {
-    fn decode_array(words: &'a [u32]) -> Option<Vec<Self>> {
-        let array = ArrayView::new(words)?;
-        let mut values = Vec::with_capacity(array.len());
-        for item in array.iter() {
-            values.push(Self::decode(item)?);
-        }
-        Some(values)
-    }
-
-    fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        encode_object_array(values, buffer)
-    }
-}
+impl<'a> MutableArrayElement<'a> for String {}
 
 impl<'a> MutableMapKey<'a> for String {
     fn decode_key(field: FieldView<'a>) -> Option<Self> {
@@ -940,20 +919,7 @@ impl<'a> MutableField<'a> for Vec<u8> {
     }
 }
 
-impl<'a> MutableArrayElement<'a> for Vec<u8> {
-    fn decode_array(words: &'a [u32]) -> Option<Vec<Self>> {
-        let array = ArrayView::new(words)?;
-        let mut values = Vec::with_capacity(array.len());
-        for item in array.iter() {
-            values.push(Self::decode(item)?);
-        }
-        Some(values)
-    }
-
-    fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        encode_object_array(values, buffer)
-    }
-}
+impl<'a> MutableArrayElement<'a> for Vec<u8> {}
 
 impl<'a, T: MutableArrayElement<'a>> MutableField<'a> for MutableArray<'a, T> {
     fn decode(field: FieldView<'a>) -> Option<Self> {
@@ -982,10 +948,6 @@ impl<'a, T: MutableArrayElement<'a>> MutableField<'a> for MutableArray<'a, T> {
 
     fn is_dirty(&self) -> bool {
         self.dirty || self.values.iter().any(MutableField::has_nested_dirty)
-    }
-
-    fn has_nested_dirty(&self) -> bool {
-        self.is_dirty()
     }
 }
 
@@ -1021,22 +983,9 @@ impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableField<'a> for Mutable
                 .iter()
                 .any(|(_, value)| value.has_nested_dirty())
     }
-
-    fn has_nested_dirty(&self) -> bool {
-        self.is_dirty()
-    }
 }
 
 impl<'a, T: MutableArrayElement<'a>> MutableArrayElement<'a> for MutableArray<'a, T> {
-    fn decode_array(words: &'a [u32]) -> Option<Vec<Self>> {
-        let array = ArrayView::new(words)?;
-        let mut values = Vec::with_capacity(array.len());
-        for item in array.iter() {
-            values.push(Self::from_words(item.object_words()?)?);
-        }
-        Some(values)
-    }
-
     #[inline(always)]
     fn detect_array_field(field: FieldView<'a>) -> Option<&'a [u32]> {
         field
@@ -1044,27 +993,11 @@ impl<'a, T: MutableArrayElement<'a>> MutableArrayElement<'a> for MutableArray<'a
             .and_then(detect_array_words::<T>)
             .or_else(|| T::detect_array_field(field))
     }
-
-    fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        encode_object_array(values, buffer)
-    }
 }
 
 impl<'a, K: MutableMapKey<'a>, V: MutableField<'a>> MutableArrayElement<'a>
     for MutableMap<'a, K, V>
 {
-    fn decode_array(words: &'a [u32]) -> Option<Vec<Self>> {
-        let array = ArrayView::new(words)?;
-        let mut values = Vec::with_capacity(array.len());
-        for item in array.iter() {
-            values.push(Self::from_words(item.object_words()?)?);
-        }
-        Some(values)
-    }
-
-    fn encode_array(values: &[Self], buffer: &mut Buffer) -> Result<Unit, MutableError> {
-        encode_object_array(values, buffer)
-    }
 }
 
 impl<'a, T: MutableField<'a>> MutableField<'a> for Box<T> {
@@ -1131,6 +1064,24 @@ mod tests {
     use super::{MutableArray, MutableMap, drop_present_unit, should_omit_message_unit};
     use crate::mutable::MutableField;
     use crate::{ArrayView, Buffer, MapView, Unit};
+
+    #[test]
+    fn default_object_array_encoding_handles_stack_and_heap_sizes() {
+        let mut buffer = Buffer::new();
+        for count in [0, 1, 31, 32, 33, 65, 1, 0] {
+            buffer.clear();
+            let values: Vec<_> = (0..count).map(|i| "x".repeat(i % 17)).collect();
+            let array = MutableArray::from(values.clone());
+            let unit = array.encode_to_unit(&mut buffer).unwrap();
+            let words = if unit.is_segment() {
+                buffer.view()
+            } else {
+                unit.inline_words()
+            };
+            let decoded = MutableArray::<String>::from_words(words).unwrap();
+            assert_eq!(decoded.as_slice(), values, "count {count}");
+        }
+    }
 
     #[test]
     fn array_ex_iter_mut_marks_collection_dirty() {

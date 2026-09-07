@@ -623,3 +623,19 @@ fn generated_partly_serialization_matches_fixture() {
     assert_eq!(encoded.len(), words.len());
     assert_eq!(encoded, words);
 }
+
+#[test]
+fn dynamic_container_workloads_match_protobuf_traversal() {
+    let schema = fixture_root().join("proto/test.proto");
+    let root = load_benchmark_dynamic_message(protobuf_fixture_bytes(), &schema).unwrap();
+    for maps in [false, true] {
+        let dynamic = container_workload(&root, maps);
+        let protobuf = pb::Main::decode(dynamic.encode_to_vec().as_slice()).unwrap();
+        let mut expected = Junk::default();
+        traverse_pb_main(&protobuf, &mut expected);
+        let words = serialize_dynamic(&dynamic).unwrap();
+        let mut actual = Junk::default();
+        traverse_pc_main(MessageView::new(&words).unwrap(), &mut actual).unwrap();
+        assert_eq!(actual.fuse(), expected.fuse(), "maps={maps}");
+    }
+}

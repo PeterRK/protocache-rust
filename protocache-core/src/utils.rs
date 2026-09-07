@@ -98,7 +98,7 @@ pub enum CorruptionKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Error returned when compressed input is malformed or incomplete.
+/// Error returned when encoded or compressed input is malformed or incomplete.
 pub struct ReadError {
     /// The detected corruption category.
     pub kind: CorruptionKind,
@@ -207,7 +207,10 @@ impl Buffer {
         }
     }
 
-    /// Prepends `delta` zero-initialized words and returns them for writing.
+    /// Prepends `delta` initialized words and returns them for writing.
+    ///
+    /// Reused storage can contain previous data. Callers must write every word
+    /// they expose, including padding; this method does not clear the region.
     #[inline(always)]
     pub fn expand(&mut self, delta: usize) -> &mut [u32] {
         if self.off < delta {
@@ -346,6 +349,14 @@ pub fn decompress(src: &[u8]) -> Result<Vec<u8>, ReadError> {
 ///
 /// Malformed input clears `out` before returning an error.
 pub fn decompress_into(src: &[u8], out: &mut Vec<u8>) -> Result<(), ReadError> {
+    let result = decompress_into_impl(src, out);
+    if result.is_err() {
+        out.clear();
+    }
+    result
+}
+
+fn decompress_into_impl(src: &[u8], out: &mut Vec<u8>) -> Result<(), ReadError> {
     if src.is_empty() {
         out.clear();
         return Ok(());
@@ -500,6 +511,19 @@ fn unpack(
 #[cfg(test)]
 mod tests {
     use super::{Buffer, compress, compress_into, decompress, decompress_into};
+
+    #[test]
+    fn decompress_errors_clear_reused_output() {
+        // Invalid length header, truncated literal run, overflowing fill run,
+        // and missing body all exercise different early error paths.
+        for input in [&[0x80][..], &[4, 3, b'a'], &[1, 0x0b], &[3]] {
+            let mut output = vec![0x55; 32];
+            assert!(decompress_into(input, &mut output).is_err());
+            assert!(output.is_empty());
+            decompress_into(&compress(b"next"), &mut output).unwrap();
+            assert_eq!(output, b"next");
+        }
+    }
 
     #[test]
     fn put_prepends_words() {
