@@ -1,0 +1,5 @@
+syntax = "proto3";
+package shared.types;
+message Common { string name = 1; }
+message Bools { repeated bool _ = 1; }
+message Entries { map<string, Common> _ = 1; }

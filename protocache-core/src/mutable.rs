@@ -1026,6 +1026,70 @@ impl<'a, T: MutableField<'a>> MutableField<'a> for Box<T> {
     }
 }
 
+#[derive(Clone, Debug)]
+/// Lazily allocated storage for a singular generated message field.
+///
+/// Empty storage does not construct `T`, so recursive message schemas have a
+/// finite default value. Existing bindings using `Box<T>` remain supported.
+pub struct LazyMessage<T> {
+    value: Option<Box<T>>,
+}
+
+impl<T> Default for LazyMessage<T> {
+    fn default() -> Self {
+        Self { value: None }
+    }
+}
+
+impl<T: Default> LazyMessage<T> {
+    /// Materializes an empty message on first access.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_or_insert_with(|| Box::new(T::default()))
+    }
+}
+
+impl<'a, T: MutableField<'a>> MutableField<'a> for LazyMessage<T> {
+    fn decode(field: FieldView<'a>) -> Option<Self> {
+        Some(Self {
+            value: Some(Box::new(T::decode(field)?)),
+        })
+    }
+
+    fn detect(field: FieldView<'a>) -> Option<&'a [u32]> {
+        T::detect(field)
+    }
+
+    fn encode(&self, buffer: &mut Buffer) -> Result<Unit, MutableError> {
+        self.value
+            .as_ref()
+            .map_or_else(|| Ok(Unit::empty()), |value| value.encode(buffer))
+    }
+
+    fn is_empty_field(&self) -> bool {
+        self.value
+            .as_ref()
+            .is_none_or(|value| value.is_empty_field())
+    }
+
+    fn folds_when_present() -> bool {
+        T::folds_when_present()
+    }
+
+    fn omits_default_after_encode() -> bool {
+        T::omits_default_after_encode()
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.value.as_ref().is_some_and(|value| value.is_dirty())
+    }
+
+    fn has_nested_dirty(&self) -> bool {
+        self.value
+            .as_ref()
+            .is_some_and(|value| value.has_nested_dirty())
+    }
+}
+
 fn encode_object_array<'a, T: MutableField<'a>>(
     values: &[T],
     buffer: &mut Buffer,

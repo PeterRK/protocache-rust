@@ -155,31 +155,35 @@ impl DescriptorPool {
                 self.enums.insert(name);
             }
         }
+        let mut names = Vec::new();
         for message in &file.message_type {
             if is_deprecated_message(message.options.as_ref()) {
                 continue;
             }
-            self.register_message(package, message)?;
+            self.register_message(package, message, &mut names)?;
         }
 
-        let names = self.descriptors.keys().cloned().collect::<Vec<_>>();
         for name in names {
-            let mut descriptor = self.descriptors.remove(&name).unwrap();
+            // Keep the symbol visible while resolving self-referential fields.
+            let mut descriptor = std::mem::take(self.descriptors.get_mut(&name).unwrap());
             self.resolve_descriptor_types(&name, &mut descriptor)?;
-            self.descriptors.insert(name, descriptor);
+            *self.descriptors.get_mut(&name).unwrap() = descriptor;
         }
         Ok(())
     }
 
-    /// Finds a message descriptor by fully qualified protobuf name.
+    /// Finds a message descriptor by fully qualified protobuf name, with or
+    /// without the leading `.`.
     pub fn find(&self, full_name: &str) -> Option<&Descriptor> {
-        self.descriptors.get(full_name)
+        self.descriptors
+            .get(full_name.strip_prefix('.').unwrap_or(full_name))
     }
 
     fn register_message(
         &mut self,
         namespace: &str,
         message: &DescriptorProto,
+        names: &mut Vec<String>,
     ) -> Result<(), RegisterError> {
         let message_name = full_name(namespace, message.name());
 
@@ -199,7 +203,7 @@ impl DescriptorPool {
                 register_map_entry_names(&mut map_entries, &message_name, nested);
                 continue;
             }
-            self.register_message(&message_name, nested)?;
+            self.register_message(&message_name, nested, names)?;
         }
 
         let live_fields = message
@@ -238,6 +242,7 @@ impl DescriptorPool {
         {
             return Err(RegisterError::DuplicateDescriptor { name: message_name });
         }
+        names.push(message_name);
         Ok(())
     }
 
@@ -257,8 +262,13 @@ impl DescriptorPool {
         let mut key = FieldType::None;
         let mut value_type = String::new();
         if matches!(value, FieldType::Message | FieldType::Unknown) {
-            let source_type = normalize_type_name(source.type_name());
-            if let Some(entry) = map_entries.get(&source_type) {
+            let source_type = source.type_name();
+            // Absolute map-entry references must name the actual enclosing type.
+            let map_name = source_type.strip_prefix('.').unwrap_or(source_type);
+            let entry = map_entries.get(map_name).filter(|entry| {
+                !source_type.starts_with('.') || full_name(message_name, entry.name()) == map_name
+            });
+            if let Some(entry) = entry {
                 let map_key = convert_type(&entry.field[0]).ok_or_else(|| {
                     RegisterError::UnsupportedFieldType {
                         message: message_name.to_owned(),
@@ -280,12 +290,12 @@ impl DescriptorPool {
                 })?;
                 key = map_key;
                 value = map_value;
-                let nested_type = normalize_type_name(entry.field[1].type_name());
+                let nested_type = entry.field[1].type_name();
                 if !nested_type.is_empty() {
-                    value_type = nested_type;
+                    value_type = nested_type.to_owned();
                 }
             } else if !source_type.is_empty() {
-                value_type = source_type;
+                value_type = source_type.to_owned();
             }
         }
 
@@ -348,28 +358,39 @@ impl DescriptorPool {
     }
 
     fn resolve_type_name(&self, containing_type: &str, type_name: &str) -> Option<String> {
-        let normalized = normalize_type_name(type_name);
-        if normalized.is_empty() {
+        if type_name.is_empty() {
             return None;
         }
-        if self.is_known_type(&normalized) {
-            return Some(normalized);
+        if let Some(absolute) = type_name.strip_prefix('.') {
+            return self.is_known_type(absolute).then(|| absolute.to_owned());
         }
-
-        let candidate = full_name(containing_type, &normalized);
-        if self.is_known_type(&candidate) {
-            return Some(candidate);
-        }
-
-        let mut scope = containing_type.to_owned();
-        while let Some(pos) = scope.rfind('.') {
-            scope.truncate(pos);
-            let candidate = full_name(&scope, &normalized);
+        let mut scope = containing_type;
+        loop {
+            let candidate = full_name(scope, type_name);
             if self.is_known_type(&candidate) {
                 return Some(candidate);
             }
+            // A qualified relative name binds its first component in the
+            // nearest scope. A missing suffix cannot bypass that binding.
+            if let Some((first, _)) = type_name.split_once('.') {
+                let first = full_name(scope, first);
+                let is_namespace = self
+                    .descriptors
+                    .keys()
+                    .chain(self.enums.iter())
+                    .any(|name| {
+                        name.strip_prefix(&first)
+                            .is_some_and(|suffix| suffix.starts_with('.'))
+                    });
+                if self.is_known_type(&first) || is_namespace {
+                    return None;
+                }
+            }
+            if scope.is_empty() {
+                return None;
+            }
+            scope = scope.rsplit_once('.').map_or("", |(parent, _)| parent);
         }
-        None
     }
 
     fn is_known_type(&self, name: &str) -> bool {
@@ -398,10 +419,6 @@ fn full_name(namespace: &str, name: &str) -> String {
     } else {
         format!("{namespace}.{name}")
     }
-}
-
-fn normalize_type_name(type_name: &str) -> String {
-    type_name.trim_start_matches('.').to_owned()
 }
 
 fn convert_type(field: &FieldDescriptorProto) -> Option<FieldType> {
@@ -612,6 +629,171 @@ mod tests {
             ArrMap arrays = 7;
         }
     "#;
+
+    #[test]
+    fn resolves_self_references_without_hiding_registered_symbols() {
+        for target in [".demo.Node", "Node", "demo.Node"] {
+            let file = FileDescriptorProto {
+                package: Some("demo".to_owned()),
+                message_type: vec![referencing_message("Node", target)],
+                ..Default::default()
+            };
+            let mut pool = DescriptorPool::default();
+            pool.register(&file).unwrap();
+            let node = pool.find(".demo.Node").unwrap();
+            assert_eq!(node.fields["child"].value_type, "demo.Node");
+            assert!(std::ptr::eq(node, pool.find("demo.Node").unwrap()));
+        }
+    }
+
+    #[test]
+    fn relative_names_prefer_inner_scopes_and_absolute_names_stay_absolute() {
+        let mut pool = DescriptorPool::default();
+        pool.register(&FileDescriptorProto {
+            message_type: vec![int_message("Foo")],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut inner = referencing_message("Inner", "Foo");
+        inner.field.push(named_field(
+            "absolute",
+            2,
+            Label::Optional,
+            Type::Message,
+            Some(".Foo"),
+            false,
+            &[],
+        ));
+        let mut root = referencing_message("Root", "Foo");
+        root.nested_type = vec![int_message("Foo"), inner];
+        pool.register(&FileDescriptorProto {
+            package: Some("demo".to_owned()),
+            message_type: vec![
+                int_message("Foo"),
+                root,
+                referencing_message("Other", "Foo"),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            pool.find("demo.Other").unwrap().fields["child"].value_type,
+            "demo.Foo"
+        );
+        assert_eq!(
+            pool.find("demo.Root").unwrap().fields["child"].value_type,
+            "demo.Root.Foo"
+        );
+        let inner = pool.find("demo.Root.Inner").unwrap();
+        assert_eq!(inner.fields["child"].value_type, "demo.Root.Foo");
+        assert_eq!(inner.fields["absolute"].value_type, "Foo");
+    }
+
+    #[test]
+    fn missing_absolute_names_never_fall_back_to_relative_types() {
+        for target in [".Foo", "..demo.Foo"] {
+            let mut pool = DescriptorPool::default();
+            let err = pool
+                .register(&FileDescriptorProto {
+                    package: Some("demo".to_owned()),
+                    message_type: vec![int_message("Foo"), referencing_message("Root", target)],
+                    ..Default::default()
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err, RegisterError::UnknownType { type_name, .. } if type_name == target)
+            );
+        }
+    }
+
+    #[test]
+    fn partially_qualified_names_do_not_bypass_shadowing() {
+        let mut outer = int_message("Foo");
+        outer.nested_type.push(int_message("Bar"));
+        let mut pool = DescriptorPool::default();
+        pool.register(&FileDescriptorProto {
+            message_type: vec![outer],
+            ..Default::default()
+        })
+        .unwrap();
+        let err = pool
+            .register(&FileDescriptorProto {
+                package: Some("demo".to_owned()),
+                message_type: vec![int_message("Foo"), referencing_message("Root", "Foo.Bar")],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, RegisterError::UnknownType { .. }));
+    }
+
+    #[test]
+    fn map_values_preserve_absolute_type_names() {
+        let mut root = DescriptorProto {
+            name: Some("Root".to_owned()),
+            nested_type: vec![map_entry(
+                "ItemsEntry",
+                Type::String,
+                None,
+                Type::Message,
+                Some(".Foo"),
+            )],
+            field: vec![named_field(
+                "items",
+                1,
+                Label::Repeated,
+                Type::Message,
+                Some(".demo.Root.ItemsEntry"),
+                false,
+                &[],
+            )],
+            ..Default::default()
+        };
+        let mut pool = DescriptorPool::default();
+        assert!(matches!(
+            pool.register(&FileDescriptorProto {
+                package: Some("demo".to_owned()),
+                message_type: vec![int_message("Foo"), root.clone()],
+                ..Default::default()
+            }),
+            Err(RegisterError::UnknownType { .. })
+        ));
+        root.nested_type[0].field[1].type_name = Some(".demo.Foo".to_owned());
+        let mut pool = DescriptorPool::default();
+        pool.register(&FileDescriptorProto {
+            package: Some("demo".to_owned()),
+            message_type: vec![int_message("Foo"), root],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            pool.find("demo.Root").unwrap().fields["items"].value_type,
+            "demo.Foo"
+        );
+    }
+
+    fn int_message(name: &str) -> DescriptorProto {
+        DescriptorProto {
+            name: Some(name.to_owned()),
+            field: vec![scalar_field("value", 1, Type::Int32)],
+            ..Default::default()
+        }
+    }
+
+    fn referencing_message(name: &str, target: &str) -> DescriptorProto {
+        DescriptorProto {
+            name: Some(name.to_owned()),
+            field: vec![named_field(
+                "child",
+                1,
+                Label::Optional,
+                Type::Message,
+                Some(target),
+                false,
+                &[],
+            )],
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn registers_targeted_schema_and_resolves_aliases() {

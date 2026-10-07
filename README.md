@@ -139,6 +139,9 @@ cargo run -p protocache-core --example basic
 
 ## Code Generation
 
+Code generation targets the portable proto3 schema subset. Proto2 compatibility
+is outside the supported scope.
+
 Build the `protoc` plugin and generate typed readonly Rust APIs from the existing test schema:
 
 ```bash
@@ -161,6 +164,32 @@ protoc \
   --pcrs_out=extra:generated \
   tests/fixtures/proto/test.proto
 ```
+
+Generate related schemas and their dependencies in the same `protoc` invocation.
+Readonly bindings use the protobuf package hierarchy, and references between
+packages use relative Rust module paths. Include related bindings at the same
+scope; that scope may itself be inside an application module.
+
+When more than one file is requested, the generator also writes `pcrs-mod.rs`.
+This combined entry merges shared packages and package prefixes, which Rust
+cannot reopen across separate files. Include it instead of the individual
+bindings:
+
+```rust,ignore
+mod schema {
+    include!("generated/pcrs-mod.rs");
+}
+```
+
+With `extra`, the combined entry includes mutable bindings as well. Mutable
+types remain available at the inclusion scope. Existing generated names are
+preserved when unique; conflicting names use enclosing protobuf names joined
+with underscores and, if necessary, a numeric suffix. Generate related schemas
+together so their naming decisions are consistent. Singular mutable message
+fields are materialized on access, allowing self-references and mutual recursion
+without constructing an infinite default object graph. Regenerate affected
+bindings to obtain these generator fixes; existing bindings retain runtime
+source compatibility.
 
 Workspace tests use the checked-in bindings by default to cover compatibility.
 To compile and test fresh bindings without modifying those snapshots:

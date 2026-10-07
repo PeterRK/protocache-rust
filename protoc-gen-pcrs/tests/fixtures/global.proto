@@ -1,0 +1,5 @@
+syntax = "proto3";
+message Plain { int32 value = 1; }
+// Collisions with a mutable re-export and a runtime import must be disambiguated.
+message PlainMutable { int32 value = 1; }
+message FieldView { int32 value = 1; }

@@ -1,0 +1,4 @@
+syntax = "proto3";
+package app.other;
+import "names.proto";
+message Other { .app.inner.Common local = 1; }

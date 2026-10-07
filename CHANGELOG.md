@@ -17,6 +17,15 @@ file. The project follows Semantic Versioning.
 
 ### Fixed
 
+- Preserve absolute protobuf type references, resolve relative references from
+  the nearest scope, and retain self-referential symbols during registration.
+  Descriptor lookup accepts fully qualified names with or without a leading dot.
+- Generate module-qualified cross-package references through public decoding
+  APIs, disambiguate colliding generated names, and provide a `pcrs-mod.rs`
+  combined entry for multi-file schemas with shared package modules.
+- Materialize singular mutable messages lazily so defaults and borrowed views
+  support recursive schemas. Preserve the existing getter signatures and
+  support for older bindings using `Box<T>`.
 - Share alias validation between reflection, dynamic encoding, and generation.
   Reject `_` fields with another declared field, a number other than 1, or a
   singular label; omit deprecated fields without reusing their field numbers.
@@ -57,6 +66,9 @@ file. The project follows Semantic Versioning.
 
 ### Migration from 0.1.1
 
+- Regenerate bindings for recursive mutable schemas, cross-package references,
+  or colliding generated names to obtain the generator fixes. Generate related
+  files together and use `pcrs-mod.rs` when their package modules overlap.
 - Update the three published package versions to `1.0.0`; existing generated
   source remains usable. Regeneration is optional when the schema is unchanged.
 - Treat raw message/array/map detection as shallow, initialize all newly exposed

@@ -16,3 +16,6 @@ categories = ["development-tools::build-utils", "encoding"]
 prost = "0.13.5"
 prost-types = "0.13.5"
 protocache-extension = { version = "1.0.0", path = "../protocache-extension" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

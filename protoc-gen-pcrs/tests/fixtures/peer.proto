@@ -1,0 +1,4 @@
+syntax = "proto3";
+package app.inner;
+import "names.proto";
+message Peer { Root root = 1; }

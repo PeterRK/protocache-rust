@@ -1,0 +1,31 @@
+syntax = "proto3";
+package app.inner;
+import "shared.proto";
+import "global.proto";
+message Common { int32 value = 1; }
+message Root {
+  .shared.types.Common child = 1;
+  repeated .shared.types.Common children = 2;
+  map<string, .shared.types.Common> objects = 3;
+  .shared.types.Bools flags = 4;
+  .shared.types.Entries entries = 5;
+  .Plain plain = 6;
+}
+message A {
+  message Items { repeated int32 _ = 1; }
+  message B { int32 value = 1; }
+  enum Mode { ZERO = 0; ONE = 1; }
+  Items items = 1;
+  B child = 2;
+  Mode mode = 3;
+}
+message B {
+  message Items { repeated int32 _ = 1; }
+  enum Mode { ZERO = 0; TWO = 2; }
+  Items items = 1;
+  Mode mode = 2;
+}
+message AB { int32 value = 1; }
+message Node { int32 value = 1; Node child = 2; repeated Node children = 3; map<string, Node> objects = 4; }
+message CyclicA { int32 value = 1; CyclicB peer = 2; }
+message CyclicB { int32 value = 1; CyclicA peer = 2; }

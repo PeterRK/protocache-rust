@@ -459,6 +459,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protocache-extension",
+ "tempfile",
 ]
 
 [[package]]
